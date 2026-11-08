@@ -1,0 +1,8 @@
+# Local RAS ticket review logs: never committed.
+/docs/
+
+# Build output (about 90 MB). Rebuild with package/build.ps1; publish as a release asset, not in git.
+/package/dist/
+
+node_modules/
+*.log

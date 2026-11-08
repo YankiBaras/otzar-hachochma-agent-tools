@@ -1,0 +1,66 @@
+---
+name: otzar-hachochma
+description: Search and read books in the user's own licensed Otzar HaChochma (אוצר החכמה) library on this PC, through the otzar-hachochma MCP tools (status, search, search_hits, get_page_text, get_page_image, book_info). Use when the user asks to find a source, a quote, a phrase or a topic in Torah literature, to check where a word appears, or to read a page of a sefer in Otzar HaChochma.
+---
+
+# Otzar HaChochma (אוצר החכמה)
+
+Otzar HaChochma is a licensed desktop library of scanned Torah books. The `otzar-hachochma` MCP server reads it in the background while the user keeps working. The tool itself creates, changes or deletes no file in the Otzar installation or on the Otzar data drive, and it never closes Otzar. One thing does get written, by Otzar itself: every `search` (including the control search of the coverage check) is an ordinary Otzar search, so Otzar saves it in its own search history, in its database (on the tested PC, `data.db` in the Otzar program folder), exactly as when the user searches by hand.
+
+## Start of a session
+
+1. Call `status` once. It connects to Otzar and starts it if it is closed.
+   - If it says Otzar is **already running without the agent connection**, ask the user to close Otzar themselves (after saving their work), then call `status` again. Never try to close it yourself.
+   - Read every `warnings` entry and tell the user about it in one line. A version warning means a newer Otzar than the one the tool was tested with; tools may still work.
+2. Once per working day, or when results look too few, call `status` with `coverage_check: true`. It runs a control search (`שבת`).
+   - If `coverage.ok` is false, tell the user that Otzar's search covers too few books. They should check the search settings in Otzar (a book list or filter may be selected, or a setting is stuck) or install the latest Otzar update. Do not tell them to run Otzar as administrator; that is not the fix.
+   - Until it is fixed, say clearly that search results are incomplete.
+
+## Workflow
+
+1. `search` with a query in Otzar syntax (below). The result has `total_results`, `books_with_results`, `library_books` and the top books by relevance, each with `book_id` and its number of `results`.
+2. `search_hits` with a `book_id` from those results: the pages where the query matched (`page` = position in the book, `page_label` = the printed page or daf), with snippets. The hit words are marked «like this».
+3. `get_page_text` for the full OCR text of a page, and `get_page_image` to see the page itself. Look at the image whenever the exact wording matters: OCR has mistakes, misses vocalization and abbreviations, and mixes columns.
+4. `book_info` for the bibliographic details to cite: name, volume, author, place and year.
+
+`search_hits` works on the **current** search. If the user or another call ran a different search in the meantime, run `search` again.
+
+The search is typed into Otzar's own search panel, so the user sees each search there, it replaces what they had there, and Otzar adds it to its search history. Tell the user this before running many searches while they work in Otzar. If Otzar is busy with another search, the tool waits for it to finish first. If the user starts another search while the tool's search runs, the tool reports an error instead of returning the wrong results: just run it again.
+
+## Citing
+
+Every quote or claim from Otzar needs: book name, volume if any, author, and the page label (`page_label`), or the position (`page`) if there is no label. Quote from the page text. Check the image when the text looks garbled. Never invent a quote that you did not read through the tools.
+
+## Search syntax (Otzar HaChochma help guide)
+
+Separate words with spaces. Without symbols, Otzar finds each word in exactly the form typed (no prefix letters), with the words near each other.
+
+| Symbol | Meaning | Example |
+|---|---|---|
+| `+` | Also with prefix letters (אותיות שימוש: ו, ה, ב, ל, מ, ש, כ…) | `+שבת` |
+| `-` | Between two words: the words right next to each other | `מעשה-בראשית` |
+| `&` | The words in this order | `מעשה & בראשית` |
+| `{N}` | At most N words between the two words. Write it attached to the words, without spaces | `מעשה{3}בראשית` |
+| `--` | Exclude: results without this word | `שבת --חול` |
+| `#` | Also OCR look-alike letters (ד/ר, ט/מ…) | `#ראשית` |
+| `@` | Both full and defective spelling (כתיב מלא/חסר) | `@שולחן` |
+| `*` | Any number of letters | `ברא*` |
+| `?` | Exactly one letter | `ב?ר` |
+| `!` | Up to the maximum number of letters | `ברא!` |
+
+Tips:
+
+- Start broad, then narrow down with `-`, `&`, `{N}` and `--`. A symbol written the wrong way (for example `{3}` between spaces, or `-` before a single word) can give zero results; if a query with symbols returns 0, try it without them.
+- Abbreviations (ראשי תיבות) and gershayim appear in many forms. Try with and without `"`, and try the spelled-out words.
+- Old books have more OCR errors. Use `#`, or search a rarer word from the same passage.
+- Zero results do not prove that a text does not exist. OCR may have missed it, or the book may not be in this user's license.
+
+## Licenses differ between users
+
+Each user's Otzar license includes different book packages. A book, or a search result, that one user has may be missing for another. If a known book is missing, `book_info` says it is not in this library, or its image is a small "error" placeholder. Say that it may be outside the user's license. Do not say that the book does not exist.
+
+## What not to do
+
+- Do not close, restart or reconfigure Otzar, and do not ask the tool to.
+- Do not try to reach Otzar in other ways (screenshots, mouse clicks, other ports). Use these tools only.
+- Do not copy whole books. Read the pages the user's question needs.
