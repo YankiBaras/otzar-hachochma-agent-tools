@@ -1,6 +1,6 @@
 # Otzar HaChochma for AI agents: portable package (IT-742)
 
-Lets an AI agent (Claude Desktop, Claude Code, or any MCP client) search and read the user's own licensed Otzar HaChochma library in the background, while the user keeps working. The package itself creates, changes or deletes no file in the Otzar installation or on its data drive, and it never closes Otzar. Searches are the exception, written by Otzar itself: `search` and the coverage check are ordinary Otzar searches, so Otzar saves them in its own search history (on the tested PC, `data.db` in the Otzar program folder), and they replace the search shown on screen.
+Lets an AI agent (Claude Desktop, Claude Code, or any MCP client) search and read the user's own licensed Otzar HaChochma library in the background, while the user keeps working. The package itself creates, changes or deletes no file in the Otzar installation or on its data drive, and it never closes Otzar. The only file it ever writes is its own desktop shortcut, and only when you run `otzar-mcp.exe shortcut`. Searches are the exception, written by Otzar itself: `search` and the coverage check are ordinary Otzar searches, so Otzar saves them in its own search history (on the tested PC, `data.db` in the Otzar program folder), and they replace the search shown on screen.
 
 ## What's inside
 
@@ -22,14 +22,31 @@ Lets an AI agent (Claude Desktop, Claude Code, or any MCP client) search and rea
      { "mcpServers": { "otzar-hachochma": { "command": "C:\\Users\\<you>\\AppData\\Local\\OtzarMcp\\otzar-mcp.exe" } } }
      ```
 3. Install the skill: copy the `otzar-hachochma` folder to `%USERPROFILE%\.claude\skills\`, or upload it as a skill in Claude.
+4. Recommended: make the desktop shortcut once, from the folder of step 1:
+   ```
+   "%LOCALAPPDATA%\OtzarMcp\otzar-mcp.exe" shortcut
+   ```
+   It adds **"אוצר החכמה ל-AI"** to the desktop. Open Otzar from this shortcut instead of the usual one, and the agent can always connect to it.
+
+## The "אוצר החכמה ל-AI" shortcut
+
+- Otzar can accept the agent connection (a debugging port) only if it was opened with one. The usual Otzar shortcut opens it without, so the agent cannot connect to an Otzar opened that way.
+- The new shortcut runs `otzar-mcp.exe launch --shortcut`:
+  - Otzar not running: it opens Otzar with a free debugging port picked at that moment, so a busy port is never a problem.
+  - Otzar already running with the connection: it only brings Otzar to the front.
+  - Otzar already running without the connection: a message asks you to close Otzar (save first) and open it again from this shortcut. Nothing is closed.
+- It is a normal shortcut on your desktop, with Otzar's icon. Otzar's own shortcut and files are not changed. Running `shortcut` again updates it (for example after moving `otzar-mcp.exe`). A file with the same name that is not this tool's shortcut is left alone.
+- The shortcut points to `otzar-mcp.exe`. If you move or delete that file, run `shortcut` again from the new place.
 
 ## How it connects to Otzar
 
 - It finds Otzar through the `OTZARAPPCD` variable set by the installer. If that fails, it tries desktop or Start-menu shortcuts to `otzar.exe`, then the standard `\OtzarApp\OtzarLocal\launcher\bin\x64|x86\app` folder on each local fixed disk (network, removable and optical drives are skipped).
-- If Otzar is closed, the first tool call starts it with a free debugging port on 127.0.0.1. Run `otzar-mcp.exe launch` to do the same by hand.
-  - It starts Otzar at most once per server run, and only from a normal user environment.
+- If Otzar is closed, the next tool call starts it with a free debugging port on 127.0.0.1. Run `otzar-mcp.exe launch` to do the same by hand.
+  - **Closing Otzar is fine.** If you close Otzar, the next request opens it again. There is no need to restart Claude.
+  - Protection against a start loop: at most 2 automatic starts in 10 minutes. If a start never connects (Otzar shows an error, for example), the tool does not start Otzar again by itself until you open Otzar from the shortcut. In both cases the agent gets a message telling you what to do.
+  - Otzar is started only from a normal user environment.
   - Set `OTZAR_MCP_NO_LAUNCH=1` to turn automatic start off.
-- If Otzar is already open without the debugging port, the tool asks the user to close it and try again. It never closes Otzar itself.
+- If Otzar is already open without the debugging port, the tool asks you to close it and try again, or to open it from the shortcut. It never closes Otzar itself.
 - `otzar-mcp.exe doctor [--coverage]` prints the connection, versions and capabilities. `--coverage` adds the coverage check.
 
 ## Tools

@@ -4,7 +4,9 @@
 // What it does:
 //   * Finds the Otzar install (OTZARAPPCD env var, then shortcuts, then known folders; x64 and x86).
 //   * Finds the CDP port of a running Otzar from its own command line, or starts Otzar with a free
-//     port. It never kills or restarts Otzar, and never writes any file.
+//     port. It never kills or restarts Otzar, and never writes any file of Otzar. After the user
+//     closes Otzar, the next call starts it again, with launch-loop protection (IT-779).
+//   * "otzar-mcp.exe shortcut" writes one .lnk on the user's desktop (IT-779); nothing else is written.
 //   * Exposes MCP tools over stdin/stdout: status, search, search_hits, get_page_text,
 //     get_page_image, book_info.
 //
@@ -33,6 +35,14 @@ const CALL_TIMEOUT_MS = 60_000;
 const OCR_CHUNK = 200; // the OCR route returns at most ~200 words per call
 const COVERAGE_QUERY = "שבת"; // "shabbat": appears in almost every book
 const COVERAGE_MIN_RATIO = 0.5;
+// Launch-loop protection (IT-742 incident, IT-779): at most START_CAP automatic starts per
+// START_WINDOW_MS, and none after a start that never answered on its debugging port.
+const START_CAP = 2;
+const START_WINDOW_MS = 10 * 60_000;
+// IT-779: desktop shortcut that opens Otzar through this tool, so the tool can always connect.
+const SHORTCUT_NAME = "אוצר החכמה ל-AI";
+const SHORTCUT_ARGS = "launch --shortcut";
+const SHORTCUT_HINT = `from the desktop shortcut "${SHORTCUT_NAME}" (made once with: otzar-mcp.exe shortcut)`;
 
 const log = (...a) => process.stderr.write(`[otzar-mcp] ${a.join(" ")}\n`);
 
@@ -69,9 +79,10 @@ class UserError extends Error {}
 const SYS32 = path.join(process.env.SystemRoot || process.env.SYSTEMROOT || process.env.windir || "C:\\Windows", "System32");
 
 // Throws if PowerShell could not run, so a failed lookup never looks like an empty answer.
-function ps(script) {
+// `env` passes values (paths, texts) as environment variables, so they are never part of the script.
+function ps(script, env) {
   const r = spawnSync(path.join(SYS32, "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    encoding: "utf8", windowsHide: true, timeout: 30_000,
+    encoding: "utf8", windowsHide: true, timeout: 30_000, env: env ? { ...process.env, ...env } : process.env,
   });
   if (r.error || r.status !== 0) throw new Error(`PowerShell failed: ${r.error ? r.error.message : String(r.stderr || "").trim().slice(0, 200)}`);
   return (r.stdout || "").trim();
@@ -171,60 +182,139 @@ async function cdpVersion(port) {
   } catch { return null; }
 }
 
-// Seams for the offline tests (package/test). Production code always uses the real functions.
-const deps = { otzarProcesses: () => otzarProcesses(), findInstall: () => findInstall(), spawn: (...a) => spawn(...a) };
+// --- desktop shortcut and popup helpers (Windows Script Host through PowerShell) ---
+// PowerShell 5 writes its console code page by default; UTF-8 keeps Hebrew paths intact.
+const PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8;";
+function desktopDir() {
+  return ps(`${PS_UTF8} [Environment]::GetFolderPath('Desktop')`).split(/\r?\n/)[0].trim();
+}
+// Returns { target, args } for an existing .lnk, or null when there is no file at that path.
+function readShortcut(lnk) {
+  if (!fs.existsSync(lnk)) return null;
+  const out = ps(`${PS_UTF8} $s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:OTZAR_MCP_LNK); @{ target = $s.TargetPath; args = $s.Arguments } | ConvertTo-Json -Compress`, { OTZAR_MCP_LNK: lnk });
+  try { const j = JSON.parse(out); return { target: j.target || "", args: j.args || "" }; } catch { return { target: "", args: "" }; }
+}
+function writeShortcut(spec) {
+  ps(`$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:OTZAR_MCP_LNK)
+    $s.TargetPath = $env:OTZAR_MCP_TARGET; $s.Arguments = $env:OTZAR_MCP_ARGS
+    $s.WorkingDirectory = $env:OTZAR_MCP_WD; $s.IconLocation = $env:OTZAR_MCP_ICON
+    $s.Description = $env:OTZAR_MCP_DESC; $s.WindowStyle = 7
+    $s.Save()`, {
+    OTZAR_MCP_LNK: spec.path, OTZAR_MCP_TARGET: spec.target, OTZAR_MCP_ARGS: spec.args,
+    OTZAR_MCP_WD: spec.workingDir, OTZAR_MCP_ICON: spec.icon, OTZAR_MCP_DESC: spec.description,
+  });
+}
+// A message box for the user (the shortcut has no visible console). Right-to-left, topmost.
+function popup(text) {
+  // 48 warning icon + 4096 system modal + 0x80000 right-aligned + 0x100000 RTL reading order.
+  ps(`[void](New-Object -ComObject WScript.Shell).Popup($env:OTZAR_MCP_TEXT, 0, $env:OTZAR_MCP_TITLE, 48 + 4096 + 0x80000 + 0x100000)`,
+    { OTZAR_MCP_TEXT: text, OTZAR_MCP_TITLE: SHORTCUT_NAME });
+}
+// Brings Otzar's window to the front, best effort (only focus; nothing is changed).
+function activate(pids) {
+  ps(`$sh = New-Object -ComObject WScript.Shell; foreach ($p in ($env:OTZAR_MCP_PIDS -split ',')) { if ($p -and $sh.AppActivate([int]$p)) { break } }`,
+    { OTZAR_MCP_PIDS: pids.filter((p) => Number.isInteger(p)).join(",") });
+}
+const isSea = (() => { try { return require("node:sea").isSea(); } catch { return false; } })();
 
-const state = { port: null, install: null, launchedByUs: false, warnings: new Set(), checked: false, coverage: null };
+// Seams for the offline tests (package/test). Production code always uses the real functions.
+const deps = {
+  otzarProcesses: () => otzarProcesses(), findInstall: () => findInstall(), spawn: (...a) => spawn(...a),
+  now: () => Date.now(),
+  selfExe: () => (isSea ? process.execPath : null),
+  desktopDir: () => desktopDir(), readShortcut: (p) => readShortcut(p), writeShortcut: (s) => writeShortcut(s),
+  popup: (t) => popup(t), activate: (pids) => activate(pids),
+};
+
+// starts: times of the automatic starts by this process (for the cap).
+// noAnswer: the last automatic start has not answered on its debugging port yet. It is cleared by
+// any successful connection (also to an Otzar the user opened from the shortcut).
+const state = { port: null, install: null, launchedByUs: false, starts: [], noAnswer: false, lastStartPort: null,
+  warnings: new Set(), checked: false, coverage: null };
+
+const MSG_ALREADY_OPEN =
+  "Otzar HaChochma is open without the agent connection (it was opened in the usual way, so no debugging port). " +
+  "Tell the user: save your work and close Otzar, then call this tool again (it reopens Otzar with the connection), " +
+  `or open Otzar ${SHORTCUT_HINT}. Nothing was closed or changed. Do not retry until the user has done this.`;
+
+function connected(port) {
+  state.port = port;
+  state.noAnswer = false;
+  return port;
+}
 
 // Makes sure Otzar runs with a CDP port and returns the port. Starts Otzar if it isn't running
 // (unless OTZAR_MCP_NO_LAUNCH=1). Never kills or restarts it.
-async function ensureOtzar() {
-  if (state.port && (await cdpVersion(state.port))) return state.port;
+// waitForWindow=false returns as soon as the debugging port answers (used by the shortcut).
+async function ensureOtzar({ waitForWindow = true } = {}) {
+  if (state.port && (await cdpVersion(state.port))) return connected(state.port);
   state.port = null;
   const envPort = process.env.OTZAR_CDP_PORT;
   if (envPort) {
     const p = int(envPort, "OTZAR_CDP_PORT", 1, 65535);
-    if (await cdpVersion(p)) return (state.port = p);
+    if (await cdpVersion(p)) return connected(p);
   }
   const procs = deps.otzarProcesses();
   if (procs.length) {
     for (const p of procs) {
       const m = /--remote-debugging-port=(\d{1,5})\b/.exec(p.cmd);
-      if (m && (await cdpVersion(Number(m[1])))) return (state.port = Number(m[1]));
+      if (m && (await cdpVersion(Number(m[1])))) return connected(Number(m[1]));
     }
-    throw new UserError(
-      "Otzar HaChochma is already running without the agent connection (no debugging port). " +
-      "Please close Otzar yourself (save your work first) and try again: the tool will reopen it with the connection. " +
-      "Nothing was closed or changed.");
+    const ours = state.lastStartPort && procs.some((p) => p.cmd.includes(`--remote-debugging-port=${state.lastStartPort}`));
+    if (ours) {
+      throw new UserError(
+        "Otzar HaChochma, started by this tool, is running but its agent connection does not answer (it is still loading, or it shows an error). " +
+        "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.");
+    }
+    throw new UserError(MSG_ALREADY_OPEN);
   }
-  // At most one automatic start per server process: if the started Otzar went away, it is not
-  // started again in a loop (IT-742 incident: three instances in two minutes).
-  if (state.launchedByUs) throw new UserError("Otzar HaChochma was already started once by this tool and is no longer reachable. Check Otzar on the screen, close it if it shows an error, and start it again yourself.");
-  if (process.env.OTZAR_MCP_NO_LAUNCH === "1") throw new UserError("Otzar HaChochma is not running, and automatic start is disabled (OTZAR_MCP_NO_LAUNCH=1).");
+  // Otzar is not running: the user closed it, or it never ran. It may be started again
+  // (IT-779), but not in a loop (IT-742 incident: three instances in two minutes).
+  if (process.env.OTZAR_MCP_NO_LAUNCH === "1") throw new UserError("Otzar HaChochma is not running, and automatic start is disabled (OTZAR_MCP_NO_LAUNCH=1). Tell the user to open Otzar " + SHORTCUT_HINT + ".");
+  if (state.noAnswer) {
+    throw new UserError(
+      "Otzar HaChochma was started by this tool earlier, but it never answered on its agent connection, so the tool does not start it again by itself (loop protection). " +
+      `Tell the user: if Otzar shows an error, close it; then open Otzar ${SHORTCUT_HINT}, and call this tool again. Do not retry until the user has done this.`);
+  }
+  const now = deps.now();
+  state.starts = state.starts.filter((t) => now - t < START_WINDOW_MS);
+  if (state.starts.length >= START_CAP) {
+    const mins = Math.max(1, Math.ceil((state.starts[0] + START_WINDOW_MS - now) / 60_000));
+    throw new UserError(
+      `Otzar HaChochma was started by this tool ${state.starts.length} times in the last ${START_WINDOW_MS / 60_000} minutes and was closed again each time, so it is not started again now (loop protection). ` +
+      `Tell the user: open Otzar ${SHORTCUT_HINT}, then call this tool again; or try again in ${mins} minute(s).`);
+  }
   const inst = (state.install = state.install || deps.findInstall());
   if (!inst) throw new UserError("Otzar HaChochma installation not found (no OTZARAPPCD variable, no shortcut to otzar.exe, no standard folder).");
   // Otzar started from a stripped environment fails in its main process (IT-742 incident:
   // "Failed to load image ... app.ico"). Only start it with a normal user environment.
   const missing = ["SystemRoot", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP"].filter((k) => !process.env[k]);
   if (missing.length) {
-    throw new UserError(`Otzar HaChochma is not running, and this tool was started without a normal user environment (missing: ${missing.join(", ")}), so it will not start Otzar. Start Otzar for agents yourself with "otzar-mcp.exe launch" from a normal command window.`);
+    throw new UserError(`Otzar HaChochma is not running, and this tool was started without a normal user environment (missing: ${missing.join(", ")}), so it will not start Otzar. Tell the user to open Otzar ${SHORTCUT_HINT}, or to run "otzar-mcp.exe launch" from a normal command window.`);
   }
   const port = await freePort();
   log(`starting ${inst.exe} with CDP port ${port}`);
   // Only one extra switch. --remote-allow-origins is deliberately not passed.
   const child = deps.spawn(inst.exe, [`--remote-debugging-port=${port}`], { cwd: path.dirname(inst.exe), detached: true, stdio: "ignore", windowsHide: false });
   child.unref();
+  // Recorded before waiting: a start that never answers blocks the next automatic start.
   state.launchedByUs = true;
+  state.starts.push(now);
+  state.noAnswer = true;
+  state.lastStartPort = port;
   const t0 = Date.now();
   while (Date.now() - t0 < LAUNCH_WAIT_MS) {
     await sleep(1000);
     if (await cdpVersion(port)) {
-      state.port = port;
-      await waitReady(Math.max(5000, LAUNCH_WAIT_MS - (Date.now() - t0)));
+      connected(port);
+      if (waitForWindow) await waitReady(Math.max(5000, LAUNCH_WAIT_MS - (Date.now() - t0)));
       return port;
     }
   }
-  throw new UserError(`Otzar was started but its debugging port ${port} did not answer within ${LAUNCH_WAIT_MS / 1000}s.`);
+  throw new UserError(
+    `Otzar HaChochma was started, but its agent connection (port ${port}) did not answer within ${LAUNCH_WAIT_MS / 1000}s. ` +
+    "If Otzar is still loading, call the tool again in a minute. Otherwise tell the user: check Otzar on the screen and close it if it shows an error. " +
+    "The tool will not start Otzar again by itself until it has connected once.");
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -248,7 +338,12 @@ async function session() {
   const page = await mainPage(port);
   if (!page) throw new UserError("Otzar's main window is not available yet (still loading?). Try again in a few seconds.");
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((ok, fail) => { ws.onopen = ok; ws.onerror = () => fail(new Error("CDP websocket error")); });
+  // Bounded, so a half-closed Otzar can never hang the call (and every call queued after it).
+  await new Promise((ok, fail) => {
+    const t = setTimeout(() => { try { ws.close(); } catch {} fail(new Error("CDP websocket did not open")); }, 10_000);
+    ws.onopen = () => { clearTimeout(t); ok(); };
+    ws.onerror = () => { clearTimeout(t); fail(new Error("CDP websocket error")); };
+  });
   let id = 0;
   const pending = new Map();
   ws.onmessage = (m) => {
@@ -779,10 +874,20 @@ async function callTool(name, args) {
     content.unshift({ type: "text", text: JSON.stringify(data, null, 1) });
     return { content };
   } catch (e) {
-    const msg = e instanceof UserError ? e.message : `Error: ${e.message}`;
-    if (!(e instanceof UserError)) log(e.stack || e.message);
-    return { content: [{ type: "text", text: msg }], isError: true };
+    return { content: [{ type: "text", text: await errorText(e) }], isError: true };
   }
+}
+
+// The text an agent gets for a failed call. A low-level failure (CDP socket closed, fetch failed)
+// while Otzar has gone away becomes a plain message, so the agent knows what happened (IT-779).
+async function errorText(e) {
+  if (e instanceof UserError) return e.message;
+  log(e.stack || e.message);
+  if (state.port && !(await cdpVersion(state.port))) {
+    state.port = null;
+    return "Otzar HaChochma was closed, or stopped answering, during this call. Call the tool again once: it reopens Otzar, or says what the user needs to do.";
+  }
+  return `Error: ${e.message}`;
 }
 
 async function handle(msg) {
@@ -795,7 +900,8 @@ async function handle(msg) {
           protocolVersion: params?.protocolVersion || "2025-06-18",
           capabilities: { tools: {} },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-          instructions: "Read-only access to the user's licensed Otzar HaChochma library on this PC. Call status first in a session. Cite book name and page label for every quote.",
+          instructions: "Read-only access to the user's licensed Otzar HaChochma library on this PC. Call status first in a session. Cite book name and page label for every quote. " +
+            "When a tool error says \"Tell the user\", relay that text to the user and wait for them; do not retry in a loop.",
         } });
       case "ping": return isReq && reply({ jsonrpc: "2.0", id, result: {} });
       case "tools/list":
@@ -830,11 +936,77 @@ function serve() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Desktop shortcut (IT-779)
+// ---------------------------------------------------------------------------------------------
+// Creates (or updates) the desktop shortcut SHORTCUT_NAME. It runs "otzar-mcp.exe launch --shortcut",
+// which opens Otzar with a free debugging port chosen at that moment, or just brings Otzar to the
+// front when it already runs with the connection. It never touches Otzar's own shortcut or files:
+// it writes one .lnk on the user's desktop, and refuses to replace a file there that is not ours.
+async function makeShortcut() {
+  const self = deps.selfExe();
+  if (!self) throw new UserError('Run "shortcut" from otzar-mcp.exe (the shortcut points to that file).');
+  const inst = deps.findInstall();
+  if (!inst) throw new UserError("Otzar HaChochma installation not found (no OTZARAPPCD variable, no shortcut to otzar.exe, no standard folder), so no shortcut was made.");
+  const desktop = deps.desktopDir();
+  if (!desktop || !fs.existsSync(desktop)) throw new UserError("The desktop folder was not found, so no shortcut was made.");
+  const lnk = path.join(desktop, `${SHORTCUT_NAME}.lnk`);
+  const existing = deps.readShortcut(lnk);
+  if (existing && !/(^|\\)otzar-mcp[^\\]*\.exe$/i.test(existing.target)) {
+    throw new UserError(`"${lnk}" already exists and is not a shortcut of this tool, so it was left unchanged. Rename or remove it yourself, then run this command again.`);
+  }
+  const spec = {
+    path: lnk, target: self, args: SHORTCUT_ARGS, workingDir: path.dirname(self), icon: `${inst.exe},0`,
+    description: "Otzar HaChochma with the connection for AI agents (otzar-mcp)",
+  };
+  deps.writeShortcut(spec);
+  return { shortcut: lnk, target: self, arguments: SHORTCUT_ARGS, otzar: inst.exe, replaced_previous: !!existing };
+}
+
+// Text of the shortcut's message box: Hebrew only, written for the person who double-clicked.
+// The English messages are for agents ("Tell the user ...") and come out badly in an RTL box,
+// so they go to stderr only (IT-779, live test).
+function shortcutPopupText(e) {
+  const m = e instanceof UserError ? e.message : "";
+  if (m === MSG_ALREADY_OPEN) return "אוצר החכמה כבר פתוח, אבל בלי החיבור ל-AI.\nשמרו את העבודה וסגרו את אוצר החכמה, ואז פתחו אותו שוב מקיצור הדרך הזה.";
+  if (/did not answer within/.test(m)) return "אוצר החכמה נפתח, אבל החיבור ל-AI עדיין לא עונה.\nאם אוצר החכמה עדיין נטען, חכו לו. אם מופיעה בו הודעת שגיאה, סגרו אותו ופתחו שוב מקיצור הדרך הזה.";
+  if (/installation not found/.test(m)) return "לא נמצאה התקנה של אוצר החכמה במחשב הזה.";
+  return "לא הצלחנו לפתוח את אוצר החכמה עם החיבור ל-AI.\nנסו שוב בעוד דקה. אם זה חוזר, פתחו את אוצר החכמה מקיצור הדרך הרגיל.";
+}
+
+// What the shortcut runs. Returns the exit code. Errors go to a message box, since the window
+// is minimized.
+async function launchFromShortcut() {
+  try {
+    await ensureOtzar({ waitForWindow: false });
+    if (!state.launchedByUs) {
+      // Already running with the connection: the user wants to see it.
+      try { deps.activate(deps.otzarProcesses().map((p) => p.pid)); } catch {}
+    }
+    return 0;
+  } catch (e) {
+    log(e.message);
+    try { deps.popup(shortcutPopupText(e)); } catch (pe) { log("popup failed:", pe.message); }
+    return e instanceof UserError ? 2 : 1;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // CLI: no argument = MCP server. "launch" = start Otzar for agents. "doctor" = print status.
+// "shortcut" = make the desktop shortcut. "launch --shortcut" = what that shortcut runs.
 // ---------------------------------------------------------------------------------------------
 async function cli() {
   const cmd = (process.argv.slice(2).find((a) => !a.startsWith("-")) || "").toLowerCase();
   if (!cmd || cmd === "serve") return serve();
+  if (cmd === "launch" && process.argv.includes("--shortcut")) process.exit(await launchFromShortcut());
+  if (cmd === "shortcut") {
+    try {
+      process.stdout.write(JSON.stringify(await makeShortcut(), null, 1) + "\n");
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write(e.message + "\n");
+      process.exit(e instanceof UserError ? 2 : 1);
+    }
+  }
   if (cmd === "launch" || cmd === "doctor") {
     try {
       const r = cmd === "launch"
@@ -848,10 +1020,9 @@ async function cli() {
       process.exit(e instanceof UserError ? 2 : 1);
     }
   }
-  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage]]\n");
+  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage] | shortcut]\n");
   process.exit(64);
 }
 
-const isSea = (() => { try { return require("node:sea").isSea(); } catch { return false; } })();
 if (isSea || require.main === module) cli();
-module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, findInstall, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, UserError };
+module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, findInstall, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };
