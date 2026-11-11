@@ -23,6 +23,25 @@ Otzar HaChochma is a licensed desktop library of scanned Torah books. The `otzar
 3. `get_page_text` for the full OCR text of a page, and `get_page_image` to see the page itself. Look at the image whenever the exact wording matters: OCR has mistakes, misses vocalization and abbreviations, and mixes columns.
 4. `book_info` for the bibliographic details to cite: name, volume, author, place and year.
 
+## Finding a specific book (checking a citation)
+
+When the user gives a citation (book, volume, page), do not search the topic words across the whole library. Find the book first:
+
+1. `search` for the book's name as an adjacent phrase, e.g. `מסורת-משה`. Its own volumes usually come up, because the title is printed on the title pages and in running heads.
+2. Call `book_info` on one volume you found. `volumes` lists every volume of that set with its `book_id`, and `other_names` shows other titles it is listed under. Do this before concluding that a volume is missing.
+3. Open the cited page directly: `get_page_text` or `get_page_image` with `page_label` (the printed page or daf, e.g. `תה`, or `יג` for a daf). No search is needed for that.
+4. Keep a short list of the book ids you found (name, volume, `book_id`) and reuse it for the rest of the task.
+
+If a volume still does not appear, it may be listed under another title or spelling, or it may be outside this user's license. Ask the user to look it up in Otzar and give you its book number.
+
+## Saving tokens
+
+- Search with **two or three distinctive words**, not a whole sentence. Without symbols, every word must appear in exactly the typed form and near the others. One OCR error or one different word gives zero results. If a long query returns 0, drop words before deciding the text is not there.
+- Use the snippets from `search_hits` to judge a hit. Read a page with `get_page_text` only when the snippet is not enough, and pass `max_words` to read only the start of a long page.
+- Use `search_hits` with `snippets: false` and a small `max_pages` when you only need to know on which pages a book matches.
+- Ask `search` for a small `limit` (5 to 10 books) unless the user needs the full list.
+- In responsa and other books cited by siman, the scanned page often does not show the siman number. Say so instead of guessing, and give the page label you did verify.
+
 `search_hits` works on the **current** search. If the user or another call ran a different search in the meantime, run `search` again.
 
 The search is typed into Otzar's own search panel, so the user sees each search there, it replaces what they had there, and Otzar adds it to its search history. Tell the user this before running many searches while they work in Otzar. If Otzar is busy with another search, the tool waits for it to finish first. If the user starts another search while the tool's search runs, the tool reports an error instead of returning the wrong results: just run it again.
