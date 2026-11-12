@@ -12,12 +12,16 @@ Otzar HaChochma is a licensed desktop library of scanned Torah books. The `otzar
 1. Call `status` once. It connects to Otzar and starts it if it is closed.
    - If it says Otzar is **already running without the agent connection**, ask the user to close Otzar themselves (after saving their work) and open it again from the **"אוצר החכמה ל-AI"** desktop shortcut (made once with `otzar-mcp.exe shortcut`), then call `status` again. Never try to close it yourself.
    - If the user closes Otzar during the work, the next call opens it again. Do not ask them to restart Claude.
+   - If it says **the Otzar HaChochma data disk is not connected**, tell the user to connect the Otzar disk, then try again. Do not retry before that.
+   - If it says **Otzar HaChochma is stuck** (opened but not answering), relay the message: check that the disk is connected, close Otzar if it shows a message, and restart the PC if Otzar cannot be closed. Do not retry in a loop.
    - Read every `warnings` entry and tell the user about it in one line. A version warning means a newer Otzar than the one the tool was tested with; tools may still work.
 2. Once per working day, or when results look too few, call `status` with `coverage_check: true`. It runs a control search (`שבת`).
    - If `coverage.ok` is false, tell the user that Otzar's search covers too few books. They should check the search settings in Otzar (a book list or filter may be selected, or a setting is stuck) or install the latest Otzar update. Do not tell them to run Otzar as administrator; that is not the fix.
    - Until it is fixed, say clearly that search results are incomplete.
 
 ## Workflow
+
+When the question is about a known book or set, the fastest order is: `find_book` → `search` with `book_ids` (its volumes) → `get_hit_context` → `get_page_text` or `get_page_image` to verify. For a question across the whole library:
 
 1. `search` with a query in Otzar syntax (below). The result has `total_results`, `books_with_results`, `library_books` and the top books by relevance, each with `book_id` and its number of `results`.
 2. `search_hits` with a `book_id` from those results: the pages where the query matched (`page` = position in the book, `page_label` = the printed page or daf), with snippets. The hit words are marked «like this».
@@ -35,7 +39,8 @@ When the user gives a citation (book, volume, siman or page), do not search the 
    - Column search: `|ספר:משנה ברורה&מחבר:כהן|` (also `מקום:` and `שנה:` with a range).
 2. `go_to_reference` with the `book_id` and the reference: `סימן קכג`, `הלכות תשובה ג א`, `ב א` or `דף יג.` for Shas. It reads Otzar's own index (ציונים), so it finds the page where a siman starts even when the scan does not show the number. It returns `page`, `page_label`, `match` (how sure: `exact`, `suffix`, `whole_words`, `substring`) and `next_reference` (where the next one starts, so you know where this one ends). Check the `matched_title` before you rely on a `substring` match.
 3. `get_page_text` or `get_page_image` with that `page`.
-4. If `go_to_reference` finds nothing, call `list_references` with a short `filter` (one word of the reference) to see how this book names its sections. Many books have no index at all; then use `page_label`.
+4. If `go_to_reference` or `list_references` says it **could not read the index** of the book, they do not work on this Otzar version yet. Use `get_page_text` with `page_label`, or `search` with `book_ids`, and ask the user to send the message (or the output of `otzar-mcp.exe doctor --book <id>`) to the developer.
+   If `go_to_reference` finds nothing, call `list_references` with a short `filter` (one word of the reference) to see how this book names its sections. Many books have no index at all; then use `page_label`.
 5. Keep a short list of the book ids you found (name, volume, `book_id`) and reuse it for the rest of the task.
 
 If a volume still does not appear, it may be listed under another title or spelling, or it may be outside this user's license. Ask the user to look it up in Otzar and give you its book number.
@@ -76,7 +81,8 @@ Separate words with spaces. Without symbols, Otzar finds each word in exactly th
 Tips:
 
 - Start broad, then narrow down with `-`, `&`, `{N}` and `--`. A symbol written the wrong way (for example `{3}` between spaces, or `-` before a single word) can give zero results; if a query with symbols returns 0, try it without them.
-- Abbreviations (ראשי תיבות) and gershayim appear in many forms. Try with and without `"`, and try the spelled-out words.
+- Search **without quotation marks** (`"` or gershayim) first: a query with them often returns 0. For an abbreviation (ראשי תיבות), try it without the mark, then the spelled-out words.
+- When a word repeats on a page, `get_hit_context` can return several almost identical windows. Read one of them and skip the rest.
 - Old books have more OCR errors. Use `#`, or search a rarer word from the same passage.
 - Zero results do not prove that a text does not exist. OCR may have missed it, or the book may not be in this user's license.
 
