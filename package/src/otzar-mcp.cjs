@@ -8,7 +8,8 @@
 //     closes Otzar, the next call starts it again, with launch-loop protection (IT-779).
 //   * "otzar-mcp.exe shortcut" writes one .lnk on the user's desktop (IT-779); nothing else is written.
 //   * Exposes MCP tools over stdin/stdout: status, search, search_hits, get_page_text,
-//     get_page_image, book_info.
+//     get_page_image, book_info, and (IT-781) find_book, get_hit_context, list_references,
+//     go_to_reference.
 //
 // Security (kept from IT-741, tightened):
 //   * No listening socket at all. The agent talks to this process over stdio only.
@@ -21,12 +22,13 @@
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 
 const SERVER_NAME = "otzar-hachochma";
-const SERVER_VERSION = "1.0.0";
+const SERVER_VERSION = "1.1.0";
 const CDP_HOST = "127.0.0.1";
 // Versions this package was tested with. A difference is a warning, not an error.
 const TESTED_WITH = { electron: "18.2.0", otzarVer: 19, updatesVer: 7.40001 };
@@ -58,6 +60,9 @@ const ROUTES_GET = [
   /^api\/freesearch\/words\/search\/[A-Za-z0-9]{1,128}\/\d{1,12}\/\d{1,12}\/\d{1,12}$/, // hit offsets
 ];
 const ROUTE_POST_OCR = /^api\/books\/\d{1,12}\/pages\/\d{1,12}\/ocr$/;
+// IT-781: the reader's own index (pages + tsiyunim), read as binary (zlib) and inflated in the
+// page by bookData() only. Kept apart from ROUTES_GET, so the JSON apiGet() cannot use it.
+const ROUTE_GET_DATA = /^api\/books\/data\/\d{1,12}$/;
 
 function checkedPath(p, routes) {
   const segs = p.split("/");
@@ -80,9 +85,9 @@ const SYS32 = path.join(process.env.SystemRoot || process.env.SYSTEMROOT || proc
 
 // Throws if PowerShell could not run, so a failed lookup never looks like an empty answer.
 // `env` passes values (paths, texts) as environment variables, so they are never part of the script.
-function ps(script, env) {
+function ps(script, env, timeout = 30_000) {
   const r = spawnSync(path.join(SYS32, "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    encoding: "utf8", windowsHide: true, timeout: 30_000, env: env ? { ...process.env, ...env } : process.env,
+    encoding: "utf8", windowsHide: true, timeout, env: env ? { ...process.env, ...env } : process.env,
   });
   if (r.error || r.status !== 0) throw new Error(`PowerShell failed: ${r.error ? r.error.message : String(r.stderr || "").trim().slice(0, 200)}`);
   return (r.stdout || "").trim();
@@ -205,10 +210,14 @@ function writeShortcut(spec) {
   });
 }
 // A message box for the user (the shortcut has no visible console). Right-to-left, topmost.
+// It stays until the user presses OK (Popup's own timeout 0 = no timeout). The 30 s limit of
+// other PowerShell calls would close it by itself (IT-779 review N1), so this call gets a long
+// limit instead: only a box nobody answers for POPUP_TIMEOUT_MS is closed.
+const POPUP_TIMEOUT_MS = 12 * 60 * 60_000;
 function popup(text) {
   // 48 warning icon + 4096 system modal + 0x80000 right-aligned + 0x100000 RTL reading order.
   ps(`[void](New-Object -ComObject WScript.Shell).Popup($env:OTZAR_MCP_TEXT, 0, $env:OTZAR_MCP_TITLE, 48 + 4096 + 0x80000 + 0x100000)`,
-    { OTZAR_MCP_TEXT: text, OTZAR_MCP_TITLE: SHORTCUT_NAME });
+    { OTZAR_MCP_TEXT: text, OTZAR_MCP_TITLE: SHORTCUT_NAME }, POPUP_TIMEOUT_MS);
 }
 // Brings Otzar's window to the front, best effort (only focus; nothing is changed).
 function activate(pids) {
@@ -224,7 +233,52 @@ const deps = {
   selfExe: () => (isSea ? process.execPath : null),
   desktopDir: () => desktopDir(), readShortcut: (p) => readShortcut(p), writeShortcut: (s) => writeShortcut(s),
   popup: (t) => popup(t), activate: (pids) => activate(pids),
+  startLockName: () => startLockName(),
 };
+
+// --- start lock (IT-779 review N2) ---
+// Every otzar-mcp process (the MCP server, "launch", each shortcut double-click) takes this lock
+// before it looks for Otzar and maybe starts it, and keeps it until the started Otzar answers.
+// So two launches close together cannot both see "not running" and start two Otzars. The lock
+// is a named pipe of this user: Windows lets only one process create it, and frees it when that
+// process ends (no stale lock file). It never accepts a connection (maxConnections 0) and is not
+// a network port.
+function startLockName() {
+  const u = String(process.env.USERNAME || "user").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 40);
+  return `\\\\.\\pipe\\otzar-mcp-start-${u}`;
+}
+function tryLock(name) {
+  return new Promise((ok) => {
+    const srv = net.createServer((c) => c.destroy());
+    srv.maxConnections = 0;
+    srv.once("error", () => ok(null));
+    srv.listen(name, () => ok(srv));
+  });
+}
+const lockCtx = new AsyncLocalStorage();
+async function withStartLock(fn) {
+  if (lockCtx.getStore()) return fn(); // nested call inside this process's own locked section
+  const name = deps.startLockName();
+  const deadline = Date.now() + LAUNCH_WAIT_MS + 15_000;
+  let srv;
+  while (!(srv = await tryLock(name))) {
+    if (Date.now() > deadline) {
+      throw new UserError("Another start of Otzar HaChochma (from the shortcut or another agent) is still running. Wait a minute and call the tool again.");
+    }
+    await sleep(500);
+  }
+  try { return await lockCtx.run(true, fn); } finally { srv.close(); }
+}
+
+// The debugging ports on otzar.exe command lines (exact numbers: IT-779 review N3).
+function cmdPorts(procs) {
+  const out = [];
+  for (const p of procs) {
+    const m = /--remote-debugging-port=(\d{1,5})(?!\d)/.exec(p.cmd || "");
+    if (m && !out.includes(Number(m[1]))) out.push(Number(m[1]));
+  }
+  return out;
+}
 
 // starts: times of the automatic starts by this process (for the cap).
 // noAnswer: the last automatic start has not answered on its debugging port yet. It is cleared by
@@ -243,10 +297,16 @@ function connected(port) {
   return port;
 }
 
+const MSG_STILL_LOADING =
+  "Otzar HaChochma is starting (it was opened from the shortcut or by another agent), but its agent connection does not answer yet. " +
+  "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.";
+
 // Makes sure Otzar runs with a CDP port and returns the port. Starts Otzar if it isn't running
 // (unless OTZAR_MCP_NO_LAUNCH=1). Never kills or restarts it.
 // waitForWindow=false returns as soon as the debugging port answers (used by the shortcut).
-async function ensureOtzar({ waitForWindow = true } = {}) {
+// loadingWaitMs: how long to wait for an Otzar that was opened with a debugging port (by the
+// shortcut or another otzar-mcp process) but does not answer yet (IT-779 review N2).
+async function ensureOtzar({ waitForWindow = true, loadingWaitMs = Math.min(20_000, LAUNCH_WAIT_MS) } = {}) {
   if (state.port && (await cdpVersion(state.port))) return connected(state.port);
   state.port = null;
   const envPort = process.env.OTZAR_CDP_PORT;
@@ -254,17 +314,35 @@ async function ensureOtzar({ waitForWindow = true } = {}) {
     const p = int(envPort, "OTZAR_CDP_PORT", 1, 65535);
     if (await cdpVersion(p)) return connected(p);
   }
+  return withStartLock(() => connectOrStart({ waitForWindow, loadingWaitMs }));
+}
+
+async function connectOrStart({ waitForWindow, loadingWaitMs }) {
   const procs = deps.otzarProcesses();
   if (procs.length) {
-    for (const p of procs) {
-      const m = /--remote-debugging-port=(\d{1,5})\b/.exec(p.cmd);
-      if (m && (await cdpVersion(Number(m[1])))) return connected(Number(m[1]));
-    }
-    const ours = state.lastStartPort && procs.some((p) => p.cmd.includes(`--remote-debugging-port=${state.lastStartPort}`));
-    if (ours) {
-      throw new UserError(
-        "Otzar HaChochma, started by this tool, is running but its agent connection does not answer (it is still loading, or it shows an error). " +
-        "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.");
+    const ports = cmdPorts(procs);
+    for (const port of ports) if (await cdpVersion(port)) return connected(port);
+    if (ports.length) {
+      const ours = state.lastStartPort != null && ports.includes(state.lastStartPort);
+      if (ours && state.noAnswer) {
+        throw new UserError(
+          "Otzar HaChochma, started by this tool, is running but its agent connection does not answer (it is still loading, or it shows an error). " +
+          "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.");
+      }
+      // Opened with a debugging port by someone else (the shortcut, another agent): it is still
+      // loading. Wait for it a little instead of telling the user to close it.
+      const t0 = Date.now();
+      while (Date.now() - t0 < loadingWaitMs) {
+        await sleep(1000);
+        for (const port of ports) {
+          if (await cdpVersion(port)) {
+            connected(port);
+            if (waitForWindow) await waitReady(Math.max(5000, LAUNCH_WAIT_MS - (Date.now() - t0)));
+            return port;
+          }
+        }
+      }
+      throw new UserError(MSG_STILL_LOADING);
     }
     throw new UserError(MSG_ALREADY_OPEN);
   }
@@ -383,11 +461,63 @@ const PAGE_HELPERS = `
   const __fsInputs = () => [...document.querySelectorAll('input[id^="fs_input_"]')];
   const __fsComp = () => { for (const i of __fsInputs()) { let e = i; while (e && !e.__vue__) e = e.parentElement; if (e && e.__vue__ && e.__vue__.freeSearchBookListStore) return e.__vue__; } return null; };
   const __fsStore = () => { const c = __fsComp(); return c && c.freeSearchBookListStore; };
+  const __webpackReq = () => {
+    const K = Symbol.for('otzar-mcp.webpackRequire');
+    let req = globalThis[K] || null;
+    if (!req) {
+      const id = 'otzar_mcp_' + Date.now();
+      try { globalThis.webpackJsonp.push([[id], { [id]: (m, e, r) => { req = r; } }, [[id]]]); } catch { return null; }
+      if (req) Object.defineProperty(globalThis, K, { value: req, enumerable: false });
+    }
+    return req && req.c ? req : null;
+  };
+  // A function exported by one of Otzar's webpack modules, found by its export name (module ids
+  // and minified names change with every Otzar build).
+  const __exportFn = (name) => {
+    const req = __webpackReq(); if (!req) return null;
+    const k = Object.keys(req.c).find((k) => req.c[k] && req.c[k].exports && typeof req.c[k].exports[name] === 'function');
+    if (!k) return null;
+    const e = req.c[k].exports;
+    return (...a) => e[name](...a);
+  };
 `;
 
 function apiGet(s, p) {
   const route = checkedPath(p, ROUTES_GET);
   return s.evaluate(`(async () => { const r = await globalThis.AXIOS_OFFLINE.get(${JSON.stringify(route)}); return r.data; })()`);
+}
+
+// IT-781: the reader's index of a book: GET api/books/data/<id>, a zlib-deflated JSON array
+// [bookInfo, pages, tsiyunim, mareiMekomot]. It is inflated and parsed inside Otzar's page, and
+// only a trimmed copy comes back over CDP: refs as [title, page, type], non-empty pages as
+// [position, label]. Matching is done here (pure functions below, tested offline).
+async function bookData(s, book) {
+  const route = checkedPath(`api/books/data/${int(book, "book_id", 1)}`, [ROUTE_GET_DATA]);
+  const d = await s.evaluate(`(async () => {
+    let r;
+    try { r = await globalThis.AXIOS_OFFLINE.get(${JSON.stringify(route)}, { responseType: 'arraybuffer' }); } catch { return { missing: true }; }
+    let u8 = r.data;
+    if (u8 instanceof ArrayBuffer) u8 = new Uint8Array(u8);
+    else if (ArrayBuffer.isView(u8)) u8 = new Uint8Array(u8.buffer, u8.byteOffset, u8.byteLength);
+    else if (typeof u8 === 'string') u8 = new TextEncoder().encode(u8);
+    else return { missing: true };
+    if (!u8.byteLength) return { missing: true };
+    if (u8.byteLength > 64 * 1024 * 1024) return { tooLarge: true };
+    const text = u8[0] === 0x78
+      ? await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate'))).text()
+      : new TextDecoder().decode(u8);
+    const d = JSON.parse(text);
+    if (!Array.isArray(d)) return { missing: true };
+    const ts = Array.isArray(d[2]) ? d[2] : [], pg = Array.isArray(d[1]) ? d[1] : [];
+    return {
+      refs: ts.filter((t) => t && typeof t.title === 'string').map((t) => [t.title, Number(t.page), Number(t.type)]),
+      pages: pg.filter((p) => p && !p.empty).map((p) => [Number(p.position), String((p.pagedata && p.pagedata[0] && p.pagedata[0].letter) || '')]),
+    };
+  })()`, 90_000);
+  if (!d || d.missing) throw new UserError(`Book ${book} was not found in this library (license packages differ between users).`);
+  if (d.tooLarge) throw new UserError(`The index of book ${book} is too large to read.`);
+  if (!Array.isArray(d.pages) || !d.pages.length) throw new UserError(`Book ${book} has no pages, or it is not in this library (license packages differ between users).`);
+  return d;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -455,11 +585,15 @@ async function coverageCheck() {
 // ---------------------------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------------------------
-async function doSearch(query, limit, timeoutSec) {
+// bookIds (IT-781): optional list of validated book ids. The search then runs through the search
+// component's own doFreeSearch(text, ids), the same call Otzar's scope combo makes. It is never
+// sent on the socket directly, and never as an in-book search (that opens a book tab).
+async function doSearch(query, limit, timeoutSec, bookIds = null) {
   if (typeof query !== "string" || !query.trim()) throw new UserError("query is required");
   if (query.length > 300 || /[\u0000-\u001f\u007f]/.test(query)) throw new UserError("query must be one line, up to 300 characters");
   const q = query.trim();
   const lim = Number(limit);
+  const ids = bookIds && bookIds.length ? bookIds.map((x) => int(x, "book_ids", 1)) : null;
   return withSession(async (s) => {
     const io = {
       // One evaluation reads the state and, when Otzar is idle on this query, the results too, so
@@ -476,8 +610,21 @@ async function doSearch(query, limit, timeoutSec) {
         });
         st.results = { query: f.getFinalTextSearch, total_results: f.totalResults, books_with_results: f.currentListLength,
                        library_books: r.$store.getters['bookList/getBooksCount'] ?? null, sort: f.sortBy, books };
+        const scope = ${JSON.stringify(ids)};
+        if (scope) { const set = new Set(scope); st.results.outside_scope = list.filter((b) => !set.has(b.id)).length; }
         return st; })()`),
       submit: async () => {
+        if (ids) {
+          // Scoped search: the component's own method with the book ids. In Otzar's "special"
+          // search type the list is ignored (it would search the whole library), so refuse it.
+          const r = await s.evaluate(`(() => { ${PAGE_HELPERS} const c = __fsComp(); const r = __root();
+            if (!c || typeof c.doFreeSearch !== 'function') return 'nocomp';
+            if (r.$store.state.freeSearch.searchType === 'special') return 'special';
+            c.doFreeSearch(${JSON.stringify(q)}, ${JSON.stringify(ids)}); return 'ok'; })()`);
+          if (r === "special") throw new UserError("Otzar's search is set to the special search type, which cannot be limited to chosen books. Search without book_ids, or ask the user to switch Otzar back to the regular search.");
+          if (r !== "ok") throw new UserError("Otzar's search panel was not found. Make sure the main window finished loading.");
+          return;
+        }
         // UI-driven: focus the visible content-search input, replace its text, press Enter.
         const focused = await s.evaluate(`(() => { ${PAGE_HELPERS}
           const i = __fsInputs().find((x) => x.offsetParent) ; if (!i) return false;
@@ -494,7 +641,14 @@ async function doSearch(query, limit, timeoutSec) {
       now: Date.now,
     };
     const st = await runSearch(io, q, timeoutSec * 1000);
-    return st.results;
+    const res = st.results;
+    if (ids) {
+      const outside = res.outside_scope || 0;
+      delete res.outside_scope;
+      res.scope = { book_ids: ids, count: ids.length };
+      if (outside) res.scope_warning = `${outside} book(s) in the results are not in book_ids: Otzar did not limit this search. Treat it as a search of the whole library.`;
+    }
+    return res;
   });
 }
 
@@ -569,37 +723,156 @@ function resolvePage(pages, args) {
   return p;
 }
 
+// OCR words of one window [start, start + n) of one page part (pagedata entry), n <= OCR_CHUNK.
+// startWord is an absolute word index in the book; the route clips the request to this part's
+// [firstWord, firstWord + numWords) window and returns at most ~200 words. Some indices have no
+// word (graphics, punctuation), so positions:true is asked for as well: it returns the absolute
+// index of every returned word, which is the same numbering as the search hit offsets.
+async function ocrRange(s, book, page, pd, start, n) {
+  const pageId = int(pd.pageId ?? page.id, "pageId");
+  const route = checkedPath(`api/books/${book}/pages/${pageId}/ocr`, [ROUTE_POST_OCR]);
+  const total = int(pd.numWords || 0, "numWords");
+  const first = int(pd.firstWord || 0, "firstWord");
+  const base = { x: 0, y: 0, width: int(pd.width || 0, "width"), height: int(pd.height || 0, "height"),
+    startWord: int(start, "startWord"), numWord: int(n, "numWord", 1, OCR_CHUNK), search: [],
+    pageData: { id: int(pd.id, "id"), width: int(pd.width || 0, "width"), height: int(pd.height || 0, "height"),
+      margin: Number(pd.margin) || 0, firstWord: first, numWords: total,
+      letter: String(pd.letter ?? ""), pageId, userId: Number(pd.userId) || 0 } };
+  const [words, idx] = await s.evaluate(`(async () => {
+    const a = globalThis.AXIOS_OFFLINE, u = ${JSON.stringify(route)}, b = ${JSON.stringify(base)};
+    const t = await a.post(u, Object.assign({}, b, { positions: false }));
+    const q = await a.post(u, Object.assign({}, b, { positions: true }));
+    return [t.data, q.data]; })()`);
+  const out = [];
+  if (!Array.isArray(words)) return out;
+  const pos = Array.isArray(idx) ? idx.map(Number) : [];
+  const list = words.map(String);
+  if (list.length === pos.length + 1 && list[list.length - 1] === "") list.pop(); // empty terminator
+  list.forEach((w, i) => { if (w !== "") out.push({ w, abs: list.length === pos.length ? pos[i] : null }); });
+  return out;
+}
+
 async function pageWords(s, book, page) {
   const out = [];
   for (const pd of page.pagedata || []) {
-    const pageId = int(pd.pageId ?? page.id, "pageId");
-    const route = checkedPath(`api/books/${book}/pages/${pageId}/ocr`, [ROUTE_POST_OCR]);
     const total = int(pd.numWords || 0, "numWords");
     const first = int(pd.firstWord || 0, "firstWord");
-    // startWord is an absolute word index in the book; the route clips the request to this page's
-    // [firstWord, firstWord + numWords) window and returns at most ~200 words. Some indices have no
-    // word (graphics, punctuation), so positions:true is asked for as well: it returns the absolute
-    // index of every returned word, which is the same numbering as the search hit offsets.
     for (let start = first; start < first + total; start += OCR_CHUNK) {
-      const n = Math.min(OCR_CHUNK, first + total - start);
-      const base = { x: 0, y: 0, width: int(pd.width || 0, "width"), height: int(pd.height || 0, "height"),
-        startWord: start, numWord: n, search: [],
-        pageData: { id: int(pd.id, "id"), width: int(pd.width || 0, "width"), height: int(pd.height || 0, "height"),
-          margin: Number(pd.margin) || 0, firstWord: first, numWords: total,
-          letter: String(pd.letter ?? ""), pageId, userId: Number(pd.userId) || 0 } };
-      const [words, idx] = await s.evaluate(`(async () => {
-        const a = globalThis.AXIOS_OFFLINE, u = ${JSON.stringify(route)}, b = ${JSON.stringify(base)};
-        const t = await a.post(u, Object.assign({}, b, { positions: false }));
-        const q = await a.post(u, Object.assign({}, b, { positions: true }));
-        return [t.data, q.data]; })()`);
-      if (!Array.isArray(words)) continue;
-      const pos = Array.isArray(idx) ? idx.map(Number) : [];
-      const list = words.map(String);
-      if (list.length === pos.length + 1 && list[list.length - 1] === "") list.pop(); // empty terminator
-      list.forEach((w, i) => { if (w !== "") out.push({ w, abs: list.length === pos.length ? pos[i] : null }); });
+      out.push(...(await ocrRange(s, book, page, pd, start, Math.min(OCR_CHUNK, first + total - start))));
     }
   }
   return out;
+}
+
+// --- hits of the current search in one book (shared by search_hits and get_hit_context) ---
+async function currentHits(s, book) {
+  const fsRef = await s.evaluate(`(() => { ${PAGE_HELPERS} const f = __fsStore(); if (!f) return null;
+    const b = (f.getCurrentList?.booksList || []).find((x) => x.id === ${book});
+    return b && b.fs ? { fs: String(b.fs.fs), start: b.fs.start, end: b.fs.end, results: b.fs.results, query: f.getFinalTextSearch } : { query: f.getFinalTextSearch }; })()`);
+  if (!fsRef || !fsRef.fs) throw new UserError(`Book ${book} is not in the results of the current search${fsRef?.query ? ` ("${fsRef.query}")` : ""}. Run search first.`);
+  if (!/^[A-Za-z0-9]{1,128}$/.test(fsRef.fs)) throw new Error("internal: unexpected search-file token");
+  const hits = await apiGet(s, `api/freesearch/words/search/${fsRef.fs}/${int(fsRef.start, "start")}/${int(fsRef.end, "end")}/${book}`);
+  // Hit offsets are 1-based word numbers; OCR positions and page firstWord are 0-based.
+  const offsets = [...new Set((Array.isArray(hits) ? hits : []).map(Number).filter((x) => Number.isInteger(x) && x > 0))]
+    .map((x) => x - 1).sort((a, b) => a - b);
+  return { fsRef, offsets };
+}
+
+// Words of one phrase hit are consecutive offsets: group offsets less than 4 words apart.
+function groupOffsets(offs) {
+  const groups = [];
+  for (const off of offs) {
+    const g = groups[groups.length - 1];
+    if (g && off - g[g.length - 1] < 4) g.push(off); else groups.push([off]);
+  }
+  return groups;
+}
+
+// The page parts of a book in word order: one segment per pagedata entry.
+function pageSegments(pages) {
+  const segs = [];
+  for (const p of pages) for (const pd of p.pagedata || []) {
+    const first = Number(pd.firstWord), n = Number(pd.numWords);
+    if (Number.isInteger(first) && Number.isInteger(n) && n > 0) segs.push({ page: p, pd, first, end: first + n });
+  }
+  return segs.sort((a, b) => a.first - b.first);
+}
+
+// Plans the OCR reads for the text around one hit: [g[0] - win, g[last] + win], over the part
+// that holds the hit and at most one part before and after it (the neighbouring page). Returns
+// { seg (index of the hit's part), ranges: [{ seg, start, n }] (n <= OCR_CHUNK), cut } where cut
+// says the window was shortened at a page edge (a neighbouring part too short to fill it). The
+// book's own start and end are not a cut.
+function planHitWindow(segs, g, win) {
+  const i = segs.findIndex((x) => g[0] >= x.first && g[0] < x.end);
+  if (i < 0) return null;
+  let j = segs.findIndex((x) => g[g.length - 1] >= x.first && g[g.length - 1] < x.end);
+  if (j < i) j = i;
+  const lo = g[0] - win, hi = g[g.length - 1] + win + 1; // [lo, hi)
+  const from = Math.max(0, i - 1), to = Math.min(segs.length - 1, j + 1);
+  const ranges = [];
+  for (let k = from; k <= to; k++) {
+    const a = Math.max(lo, segs[k].first), b = Math.min(hi, segs[k].end);
+    for (let st = a; st < b; st += OCR_CHUNK) ranges.push({ seg: k, start: st, n: Math.min(OCR_CHUNK, b - st) });
+  }
+  const covLo = ranges.length ? ranges[0].start : g[0];
+  const last = ranges[ranges.length - 1];
+  const covHi = last ? last.start + last.n : g[g.length - 1] + 1;
+  // The book's own start and end are not a cut: there are no words beyond them.
+  return { seg: i, ranges, cut: covLo > Math.max(lo, segs[0].first) || covHi < Math.min(hi, segs[segs.length - 1].end) };
+}
+
+// Joins the words of a planned window: hit words in «», a page change marked with ‖.
+function hitText(parts, g) {
+  const lo = g[0], hi = g[g.length - 1];
+  const words = [];
+  let prevPage = null;
+  for (const { page, list } of parts) {
+    if (prevPage && page !== prevPage && list.length) words.push({ w: "‖", mark: false });
+    if (list.length) prevPage = page;
+    for (const x of list) words.push({ w: x.w, abs: x.abs, mark: x.abs != null && x.abs >= lo && x.abs <= hi });
+  }
+  if (!words.some((x) => x.mark)) {
+    // No exact position (an index without a word): mark the first word at or after the hit.
+    const k = words.findIndex((x) => x.abs != null && x.abs >= lo);
+    if (k >= 0) words[k].mark = true;
+  }
+  return words.map((x) => (x.mark ? `«${x.w}»` : x.w)).join(" ");
+}
+
+async function toolGetHitContext(args) {
+  const book = int(args.book_id, "book_id", 1);
+  const win = int(args.window ?? 15, "window", 1, 100);
+  const maxHits = int(args.max_hits ?? 10, "max_hits", 1, 50);
+  const offset = int(args.offset ?? 0, "offset", 0, 1e7);
+  return withSession(async (s) => {
+    const { fsRef, offsets } = await currentHits(s, book);
+    const groups = groupOffsets(offsets);
+    const pages = await pagesOf(s, book);
+    const segs = pageSegments(pages);
+    const label = (p) => p.pagedata?.[0]?.letter || null;
+    const out = [];
+    for (const g of groups.slice(offset, offset + maxHits)) {
+      const plan = planHitWindow(segs, g, win);
+      if (!plan) continue;
+      const parts = [];
+      for (const r of plan.ranges) {
+        const seg = segs[r.seg];
+        parts.push({ page: seg.page, list: await ocrRange(s, book, seg.page, seg.pd, r.start, r.n) });
+      }
+      const home = segs[plan.seg].page;
+      const text = hitText(parts, g);
+      const item = { page: home.position, page_label: label(home), text: text || "(no OCR text here)" };
+      // The window reached into the previous or next page (marked ‖ in the text).
+      const others = [...new Set(parts.filter((x) => x.list.length).map((x) => x.page))].filter((p) => p !== home);
+      if (others.length) item.other_pages = others.map((p) => ({ page: p.position, page_label: label(p) }));
+      if (plan.cut) item.cut_at_page_edge = true;
+      out.push(item);
+    }
+    const next = offset + maxHits < groups.length ? offset + maxHits : null;
+    return { query: fsRef.query, book_id: book, results_in_book: fsRef.results, total_hits: groups.length,
+      offset, returned: out.length, next_offset: next, window: win, hits: out };
+  });
 }
 
 async function toolGetPageText(args) {
@@ -620,15 +893,7 @@ async function toolSearchHits(args) {
   const maxPages = int(args.max_pages ?? 20, "max_pages", 1, 500);
   const snippets = args.snippets !== false;
   return withSession(async (s) => {
-    const fsRef = await s.evaluate(`(() => { ${PAGE_HELPERS} const f = __fsStore(); if (!f) return null;
-      const b = (f.getCurrentList?.booksList || []).find((x) => x.id === ${book});
-      return b && b.fs ? { fs: String(b.fs.fs), start: b.fs.start, end: b.fs.end, results: b.fs.results, query: f.getFinalTextSearch } : { query: f.getFinalTextSearch }; })()`);
-    if (!fsRef || !fsRef.fs) throw new UserError(`Book ${book} is not in the results of the current search${fsRef?.query ? ` ("${fsRef.query}")` : ""}. Run search first.`);
-    if (!/^[A-Za-z0-9]{1,128}$/.test(fsRef.fs)) throw new Error("internal: unexpected search-file token");
-    const hits = await apiGet(s, `api/freesearch/words/search/${fsRef.fs}/${int(fsRef.start, "start")}/${int(fsRef.end, "end")}/${book}`);
-    // Hit offsets are 1-based word numbers; OCR positions and page firstWord are 0-based.
-    const offsets = [...new Set((Array.isArray(hits) ? hits : []).map(Number).filter((x) => Number.isInteger(x) && x > 0))]
-      .map((x) => x - 1).sort((a, b) => a - b);
+    const { fsRef, offsets } = await currentHits(s, book);
     const pages = await pagesOf(s, book);
     const byPage = new Map();
     for (const off of offsets) {
@@ -640,12 +905,7 @@ async function toolSearchHits(args) {
     const list = [...byPage.entries()].slice(0, maxPages);
     const outPages = [];
     for (const [p, offs] of list) {
-      // Words of one phrase hit are consecutive offsets: group offsets less than 4 words apart.
-      const groups = [];
-      for (const off of offs) {
-        const g = groups[groups.length - 1];
-        if (g && off - g[g.length - 1] < 4) g.push(off); else groups.push([off]);
-      }
+      const groups = groupOffsets(offs);
       const item = { page: p.position, page_label: p.pagedata?.[0]?.letter || null, matches: groups.length };
       if (snippets) {
         const words = await pageWords(s, book, p);
@@ -678,19 +938,10 @@ async function toolGetPageImage(args) {
     if (typeof imgPageId === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(imgPageId)) {
       // Uses the app's own page-image loader (decodes DjVu/PDF exactly like the reader does).
       // The webpack module is looked up by its exported function name, not by a minified id.
-      dataUrl = await s.evaluate(`(async () => {
-        // The loader is found once through webpack's require and kept under a Symbol key.
-        const K = Symbol.for('otzar-mcp.webpackRequire');
-        let req = globalThis[K] || null;
-        if (!req) {
-          const id = 'otzar_mcp_' + Date.now();
-          try { globalThis.webpackJsonp.push([[id], { [id]: (m, e, r) => { req = r; } }, [[id]]]); } catch { return null; }
-          if (req) Object.defineProperty(globalThis, K, { value: req, enumerable: false });
-        }
-        if (!req || !req.c) return null;
-        const k = Object.keys(req.c).find((k) => req.c[k] && req.c[k].exports && typeof req.c[k].exports.getImageAsDataUrl === 'function');
-        if (!k) return null;
-        return await req.c[k].exports.getImageAsDataUrl(${book}, ${JSON.stringify(imgPageId)}, { resize: ${width} });
+      dataUrl = await s.evaluate(`(async () => { ${PAGE_HELPERS}
+        const f = __exportFn('getImageAsDataUrl');
+        if (!f) return null;
+        return await f(${book}, ${JSON.stringify(imgPageId)}, { resize: ${width} });
       })()`, 90_000).catch(() => null);
     }
     if (!dataUrl) {
@@ -739,6 +990,207 @@ async function toolBookInfo(args) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// IT-781: find a book by name (Otzar's F2 search, in memory)
+// ---------------------------------------------------------------------------------------------
+// Catalogue names usually leave these out ("שו"ת אגרות משה" finds a wrong book, "אגרות משה" works).
+const BOOK_PREFIX_RE = /^(?:שו["״']?ת|ספר)\s+/;
+
+// Calls Otzar's exported searchByTxt(text, special=true, state) with a THROWAWAY state object:
+// searchByTxt writes tsiyunSearch and hiddenBooks into the state it gets, so the real
+// store.state.bookList is never passed. It runs in memory on Otzar's book index: no API call,
+// no UI change, no history. Never falls back to bookList/setSearchTo (that filters the user's list).
+async function findBooksOnce(s, text, limit) {
+  const r = await s.evaluate(`(() => { ${PAGE_HELPERS}
+    const f = __exportFn('searchByTxt'); const root = __root();
+    if (!f || !root || !root.$store) return { missing: true };
+    const real = root.$store.state.bookList || {};
+    let cfg = real.searchResultConfig;
+    try { cfg = JSON.parse(JSON.stringify(cfg)); } catch {}
+    const tmp = { searchResultConfig: cfg };
+    const res = f(${JSON.stringify(text)}, true, tmp) || [];
+    const list = Array.isArray(res) ? res : [];
+    const books = list.slice(0, ${int(limit, "limit", 1, 200)}).map((x) => {
+      const b = (x && x.book) || x || {};
+      const authors = []; for (let i = 0; i < (b.authors_length || 0); i++) if (b['authors_' + i + '_name']) authors.push(b['authors_' + i + '_name']);
+      const vols = Number(b.volumes_length) || 0;
+      const isMain = !b.mainVolume || b.mainVolume === b.id;
+      const volumeIds = []; if (isMain && vols > 1) for (let i = 0; i < vols; i++) if (b['volumes_' + i + '_id']) volumeIds.push(b['volumes_' + i + '_id']);
+      return { book_id: b.id ?? x.id, name: b.name, volume: b.volume || undefined,
+        main_volume_id: isMain ? undefined : b.mainVolume,
+        volumes_in_set: vols > 1 ? vols : undefined, volume_ids: volumeIds.length ? volumeIds : undefined,
+        all_volumes_matched: x.allVolumes ? true : undefined,
+        authors: authors.length ? authors : undefined, place: b.places || undefined,
+        year: b.fromyear ? (b.toyear && b.toyear !== b.fromyear ? b.fromyear + '-' + b.toyear : b.fromyear) : undefined };
+    });
+    return { total: list.length, hidden: Number(tmp.hiddenBooks) || 0, ref: typeof tmp.tsiyunSearch === 'string' ? tmp.tsiyunSearch : '', books };
+  })()`);
+  if (!r || r.missing) throw new UserError("Otzar's book-name search was not found in this Otzar version. Update otzar-mcp, or use search with the book's name.");
+  return r;
+}
+
+async function toolFindBook(args) {
+  const query = String(args.query).replace(/^\s+|\s+$/g, ""); // inner double spaces are syntax: keep them
+  if (!query) throw new UserError("query is required");
+  const limit = int(args.limit ?? 20, "limit", 1, 200);
+  return withSession(async (s) => {
+    let used = query;
+    let r = await findBooksOnce(s, query, limit);
+    let note;
+    if (r.total < 3 && !query.startsWith("|") && BOOK_PREFIX_RE.test(query)) {
+      const shorter = query.replace(BOOK_PREFIX_RE, "");
+      const r2 = await findBooksOnce(s, shorter, limit);
+      if (r2.total > r.total) {
+        note = `"${query}" found ${r.total} book(s); catalogue names usually leave out "${query.slice(0, query.length - shorter.length).trim()}", so these are the results for "${shorter}".`;
+        used = shorter;
+        r = r2;
+      }
+    }
+    const out = { query, total_matches: r.total, returned: r.books.length, books: r.books };
+    if (used !== query) out.searched_as = used;
+    if (note) out.note = note;
+    if (r.ref.trim()) out.reference_part = r.ref.trim();
+    if (r.hidden) out.hidden_books_skipped = r.hidden;
+    if (!r.total) out.hint = "No book matched. Try fewer words, another spelling, or the |ספר:..&מחבר:..| syntax.";
+    return out;
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// IT-781: the reader's index (tsiyunim): list_references, go_to_reference
+// ---------------------------------------------------------------------------------------------
+// Type 2 = the catalogue's fine reference (daf/amud, perek/halacha), type 1 = the book's own
+// headings (siman, introduction...). Otzar itself tries type 2 first, then type 1.
+const REF_TYPE_ORDER = [2, 1];
+
+function normTitle(s) {
+  return String(s)
+    .replace(/[֑-ׇ]/g, (c) => (c === "־" ? " " : "")) // nikud and cantillation; maqaf -> space
+    .replace(/["'״׳`]/g, "")
+    .replace(/[\s ]+/g, " ")
+    .trim();
+}
+// The forms of a reference to try: "דף יג." -> "דף יג א", "יג א"; "סימן קכ"ג" -> "סימן קכג".
+function refVariants(ref) {
+  let r = String(ref).trim();
+  const amud = /^(.*\S)\s*([.:])$/.exec(r);
+  if (amud) r = `${amud[1]} ${amud[2] === "." ? "א" : "ב"}`;
+  r = normTitle(r.replace(/[.,:;()]/g, " ").replace(/\s+עמוד\s+/g, " "));
+  const out = [r];
+  const bare = r.replace(/^(?:דף|daf)\s+/i, "");
+  if (bare && bare !== r) out.push(bare);
+  return out.filter(Boolean);
+}
+const REF_TIERS = ["exact", "suffix", "whole_words", "substring"];
+function tierOf(title, v) {
+  if (title === v) return 0;
+  if (title.endsWith(` ${v}`)) return 1;
+  if (` ${title} `.includes(` ${v} `)) return 2;
+  if (title.includes(v)) return 3;
+  return -1;
+}
+
+// data = { refs: [[title, page, type]], pages: [[position, label]] } (non-empty pages).
+// Returns the entries sorted the way the reader shows them: by type order, then page (stable).
+function sortedRefs(data) {
+  return data.refs.map(([title, page, type], i) => ({ title: String(title), norm: normTitle(title), page: Number(page), type: Number(type), i }))
+    .filter((r) => Number.isInteger(r.page))
+    .sort((a, b) => a.page - b.page || a.i - b.i);
+}
+// The otzar-mcp page for a tsiyun page: that position if it is a non-empty page, else the next
+// non-empty one (else the last page).
+function pageFor(data, page) {
+  const ps = data.pages;
+  const p = ps.find((x) => x[0] === page) || ps.find((x) => x[0] > page) || ps[ps.length - 1];
+  return { page: p[0], page_label: p[1] || null };
+}
+
+function findReference(data, ref) {
+  const refs = sortedRefs(data);
+  const variants = refVariants(ref);
+  if (!variants.length) return { found: false };
+  const scored = [];
+  for (const r of refs) {
+    let best = -1;
+    for (const v of variants) { const t = tierOf(r.norm, v); if (t >= 0 && (best < 0 || t < best)) best = t; }
+    if (best >= 0) scored.push({ r, tier: best });
+  }
+  const rank = (t) => { const k = REF_TYPE_ORDER.indexOf(t); return k < 0 ? REF_TYPE_ORDER.length : k; };
+  scored.sort((a, b) => a.tier - b.tier || rank(a.r.type) - rank(b.r.type) || a.r.page - b.r.page || a.r.i - b.r.i);
+  if (scored.length) {
+    const { r, tier } = scored[0];
+    const sameType = refs.filter((x) => x.type === r.type);
+    const k = sameType.indexOf(r);
+    const nx = sameType.slice(k + 1).find((x) => x.norm !== r.norm);
+    const seen = new Set([`${r.norm}|${r.page}`]);
+    const candidates = [];
+    for (const c of scored.slice(1)) {
+      if (candidates.length >= 5) break;
+      if (seen.has(`${c.r.norm}|${c.r.page}`)) continue;
+      seen.add(`${c.r.norm}|${c.r.page}`);
+      candidates.push({ title: c.r.title, type: c.r.type, ...pageFor(data, c.r.page), match: REF_TIERS[c.tier] });
+    }
+    return {
+      found: true, matched_title: r.title, type: r.type, match: REF_TIERS[tier], ...pageFor(data, r.page),
+      next_reference: nx ? { title: nx.title, ...pageFor(data, nx.page) } : null,
+      candidates,
+    };
+  }
+  // No index entry: a printed page/daf label ("יג", "יג א").
+  for (const v of variants) {
+    const p = data.pages.find((x) => normTitle(x[1]) === v) || data.pages.find((x) => normTitle(x[1]) === `${v} א`);
+    if (p) return { found: true, matched_title: null, type: null, match: "page_label", page: p[0], page_label: p[1] || null, next_reference: null, candidates: [] };
+  }
+  return { found: false };
+}
+
+function listReferences(data, { filter, type, limit, offset }) {
+  const refs = sortedRefs(data);
+  const counts = { catalogue: refs.filter((r) => r.type === 2).length, headings: refs.filter((r) => r.type === 1).length };
+  // Default: the catalogue references when the book has them (they are the fine ones), else all.
+  const shown = type == null ? (counts.catalogue ? 2 : 0) : type;
+  let list = shown ? refs.filter((r) => r.type === shown) : refs;
+  if (shown === 0) list = list.slice().sort((a, b) => a.page - b.page || a.i - b.i);
+  const f = filter ? normTitle(filter) : "";
+  if (f) list = list.filter((r) => r.norm.includes(f));
+  const page = list.slice(offset, offset + limit).map((r) => ({ title: r.title, ...(shown ? {} : { type: r.type }), ...pageFor(data, r.page) }));
+  return {
+    total_references: refs.length, type_counts: counts, type_shown: shown === 0 ? "all" : shown,
+    filter: filter || undefined, total_matching: list.length, offset, returned: page.length,
+    next_offset: offset + limit < list.length ? offset + limit : null, references: page,
+  };
+}
+
+async function toolListReferences(args) {
+  const book = int(args.book_id, "book_id", 1);
+  const type = args.type == null ? null : int(args.type, "type", 0, 2);
+  const limit = int(args.limit ?? 100, "limit", 1, 500);
+  const offset = int(args.offset ?? 0, "offset", 0, 1e7);
+  return withSession(async (s) => {
+    const data = await bookData(s, book);
+    const r = listReferences(data, { filter: args.filter ? String(args.filter).trim() : "", type, limit, offset });
+    const out = { book_id: book, ...r };
+    if (!r.total_references) out.note = "This book has no index (tsiyunim) in Otzar. Use page_label, or search_hits / get_hit_context on a scoped search.";
+    return out;
+  });
+}
+
+async function toolGoToReference(args) {
+  const book = int(args.book_id, "book_id", 1);
+  const ref = String(args.ref).trim();
+  if (!ref) throw new UserError("ref is required");
+  return withSession(async (s) => {
+    const data = await bookData(s, book);
+    const r = findReference(data, ref);
+    if (!r.found) {
+      return { book_id: book, ref, found: false, references_in_book: data.refs.length,
+        hint: data.refs.length ? "No index entry matched. Call list_references with a filter (e.g. one word of the reference) to see the titles this book uses." : "This book has no index (tsiyunim) and no page with that label." };
+    }
+    const { found, ...rest } = r;
+    return { book_id: book, ref, found: true, ...rest };
+  });
+}
+
 async function toolStatus(args) {
   const port = await ensureOtzar();
   await waitReady(30_000);
@@ -770,14 +1222,15 @@ const TOOLS = [
   },
   {
     name: "search",
-    description: "Full-text search in all books of the user's Otzar HaChochma library, using Otzar's own search syntax (see the skill). Returns the total number of results, the number of books with results, and the top books (book_id, name, volume, authors, year, results). The search is typed into Otzar's search panel, so the user sees it there too.",
+    description: "Full-text search in the user's Otzar HaChochma library, using Otzar's own search syntax (see the skill). With book_ids, only in those books (e.g. the volumes found with find_book). Returns the total number of results, the number of books with results, and the top books (book_id, name, volume, authors, year, results). The search runs in Otzar's search panel, so the user sees it there too, and Otzar adds it to its search history.",
     inputSchema: { type: "object", properties: {
       query: { type: "string", minLength: 1, maxLength: 300, singleLine: true, notBlank: true, description: "Search text in Otzar syntax, e.g. שבת or \"מעשה & בראשית\"." },
+      book_ids: { type: "array", items: { type: "integer", minimum: 1, maximum: 999999999999 }, minItems: 1, maxItems: 200, description: "Search only in these books (1-200 ids). Omit to search the whole library." },
       limit: { type: "integer", minimum: 0, maximum: 200, description: "How many books to list (default 20)." },
       timeout_sec: { type: "integer", minimum: 10, maximum: 600, description: "Default 120." },
     }, required: ["query"], additionalProperties: false },
     run: async (a) => {
-      const r = await doSearch(a.query, a.limit == null ? 20 : int(a.limit, "limit", 0, 200), a.timeout_sec == null ? 120 : int(a.timeout_sec, "timeout_sec", 10, 600));
+      const r = await doSearch(a.query, a.limit == null ? 20 : int(a.limit, "limit", 0, 200), a.timeout_sec == null ? 120 : int(a.timeout_sec, "timeout_sec", 10, 600), a.book_ids || null);
       if (state.coverage && !state.coverage.ok) r.coverage_warning = state.coverage.warning;
       return r;
     },
@@ -791,6 +1244,47 @@ const TOOLS = [
       snippets: { type: "boolean", description: "Default true. False is faster (page list only)." },
     }, required: ["book_id"], additionalProperties: false },
     run: toolSearchHits,
+  },
+  {
+    name: "get_hit_context",
+    description: "For one book from the current search results: each hit with only the words around it (window words before and after; hit words in «», a page change marked ‖). Much cheaper than reading whole pages. Pages through the hits with offset. Run search first.",
+    inputSchema: { type: "object", properties: {
+      book_id: BOOK_ID,
+      window: { type: "integer", minimum: 1, maximum: 100, description: "Words before and after each hit (default 15)." },
+      max_hits: { type: "integer", minimum: 1, maximum: 50, description: "Hits to return (default 10)." },
+      offset: { type: "integer", minimum: 0, maximum: 10000000, description: "Skip this many hits (use next_offset)." },
+    }, required: ["book_id"], additionalProperties: false },
+    run: toolGetHitContext,
+  },
+  {
+    name: "find_book",
+    description: "Find books by name in the user's library (Otzar's F2 book search, in memory: no search panel change, no history). Returns book_id, name, volume, authors, place, year. For a multi-volume set, the main volume has volumes_in_set (the set size) and volume_ids (the book_id of every volume, for search book_ids); the other volumes have main_volume_id. Syntax: plain words; 'book name  reference' with TWO spaces returns reference_part for go_to_reference; |ספר:..&מחבר:..&מקום:..&שנה:..| searches by column.",
+    inputSchema: { type: "object", properties: {
+      query: { type: "string", minLength: 1, maxLength: 200, singleLine: true, notBlank: true, description: "Book name, e.g. אגרות משה, or משנה ברורה  סימן א, or |ספר:משנה ברורה&מחבר:כהן|." },
+      limit: { type: "integer", minimum: 1, maximum: 200, description: "How many books to list (default 20)." },
+    }, required: ["query"], additionalProperties: false },
+    run: toolFindBook,
+  },
+  {
+    name: "list_references",
+    description: "The book's index (ציונים) as Otzar's reader shows it: titles such as siman, daf/amud, perek/halacha, with the page each starts on. Type 2 = catalogue references (daf, halacha), type 1 = the book's own headings (siman, introduction). Default: type 2 if the book has it, else all. Use filter and limit; big books have thousands.",
+    inputSchema: { type: "object", properties: {
+      book_id: BOOK_ID,
+      filter: { type: "string", minLength: 1, maxLength: 100, singleLine: true, notBlank: true, description: "Only titles containing this text, e.g. סימן קכ." },
+      type: { type: "integer", minimum: 0, maximum: 2, description: "2 = catalogue references, 1 = the book's headings, 0 = all." },
+      limit: { type: "integer", minimum: 1, maximum: 500, description: "Default 100." },
+      offset: { type: "integer", minimum: 0, maximum: 10000000, description: "Use next_offset." },
+    }, required: ["book_id"], additionalProperties: false },
+    run: toolListReferences,
+  },
+  {
+    name: "go_to_reference",
+    description: "The page where a reference starts in a book (siman, daf, halacha, chapter), from Otzar's own index, even when the scan does not show the number. Returns page and page_label for get_page_text / get_page_image, the matched index title, how it matched, and next_reference (where the next one starts). Nothing changes in Otzar's window.",
+    inputSchema: { type: "object", properties: {
+      book_id: BOOK_ID,
+      ref: { type: "string", minLength: 1, maxLength: 100, singleLine: true, notBlank: true, description: "e.g. סימן קכג, הלכות תשובה ג א, ב א, דף יג., or reference_part from find_book." },
+    }, required: ["book_id", "ref"], additionalProperties: false },
+    run: toolGoToReference,
   },
   {
     name: "get_page_text",
@@ -847,6 +1341,19 @@ function validateArgs(schema, args) {
     } else if (p.type === "boolean") {
       if (typeof v !== "boolean") throw new UserError(`${k} must be true or false`);
       out[k] = v;
+    } else if (p.type === "array") {
+      // Only arrays of integers are used (book_ids). Duplicates are dropped, order is kept.
+      const min = p.minItems ?? 0, max = p.maxItems ?? 1000;
+      if (!Array.isArray(v) || v.length < min || v.length > max) throw new UserError(`${k} must be a list of ${min} to ${max} integers`);
+      const imin = p.items?.minimum ?? 0, imax = p.items?.maximum ?? 1e12;
+      const list = v.map((x) => {
+        const n = typeof x === "string" && /^[0-9]{1,15}$/.test(x) ? Number(x) : x;
+        if (typeof n !== "number" || !Number.isInteger(n) || n < imin || n > imax) throw new UserError(`${k} must contain only integers between ${imin} and ${imax}`);
+        return n;
+      });
+      out[k] = [...new Set(list)];
+    } else {
+      throw new Error(`internal: unsupported schema type for ${k}`);
     }
   }
   return out;
@@ -901,6 +1408,7 @@ async function handle(msg) {
           capabilities: { tools: {} },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
           instructions: "Read-only access to the user's licensed Otzar HaChochma library on this PC. Call status first in a session. Cite book name and page label for every quote. " +
+            "To check a citation: find_book -> go_to_reference -> get_page_text; to judge hits cheaply use get_hit_context, and search with book_ids to stay inside one book. " +
             "When a tool error says \"Tell the user\", relay that text to the user and wait for them; do not retry in a loop.",
         } });
       case "ping": return isReq && reply({ jsonrpc: "2.0", id, result: {} });
@@ -968,6 +1476,7 @@ async function makeShortcut() {
 function shortcutPopupText(e) {
   const m = e instanceof UserError ? e.message : "";
   if (m === MSG_ALREADY_OPEN) return "אוצר החכמה כבר פתוח, אבל בלי החיבור ל-AI.\nשמרו את העבודה וסגרו את אוצר החכמה, ואז פתחו אותו שוב מקיצור הדרך הזה.";
+  if (m === MSG_STILL_LOADING || /is still running\. Wait a minute/.test(m)) return "אוצר החכמה עדיין נפתח.\nחכו שיסיים להיטען. אין צורך לפתוח אותו שוב.";
   if (/did not answer within/.test(m)) return "אוצר החכמה נפתח, אבל החיבור ל-AI עדיין לא עונה.\nאם אוצר החכמה עדיין נטען, חכו לו. אם מופיעה בו הודעת שגיאה, סגרו אותו ופתחו שוב מקיצור הדרך הזה.";
   if (/installation not found/.test(m)) return "לא נמצאה התקנה של אוצר החכמה במחשב הזה.";
   return "לא הצלחנו לפתוח את אוצר החכמה עם החיבור ל-AI.\nנסו שוב בעוד דקה. אם זה חוזר, פתחו את אוצר החכמה מקיצור הדרך הרגיל.";
@@ -977,7 +1486,9 @@ function shortcutPopupText(e) {
 // is minimized.
 async function launchFromShortcut() {
   try {
-    await ensureOtzar({ waitForWindow: false });
+    // An Otzar that another double-click (or an agent) just opened is still loading: wait for it
+    // and bring it to the front, instead of telling the user to close it (IT-779 review N2).
+    await ensureOtzar({ waitForWindow: false, loadingWaitMs: LAUNCH_WAIT_MS });
     if (!state.launchedByUs) {
       // Already running with the connection: the user wants to see it.
       try { deps.activate(deps.otzarProcesses().map((p) => p.pid)); } catch {}
@@ -1025,4 +1536,6 @@ async function cli() {
 }
 
 if (isSea || require.main === module) cli();
-module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, findInstall, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };
+module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, ROUTE_GET_DATA, findInstall,
+  findReference, listReferences, refVariants, normTitle, groupOffsets, pageSegments, planHitWindow, hitText, cmdPorts,
+  shortcutPopupText, MSG_STILL_LOADING, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };

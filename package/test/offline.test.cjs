@@ -14,6 +14,9 @@ const m = require("../src/otzar-mcp.cjs");
 
 const GET = m.ROUTES_GET;
 const POST = [m.ROUTE_POST_OCR];
+// A start lock of its own, so the tests never wait on (or block) a real otzar-mcp on this PC.
+const TEST_LOCK = `\\\\.\\pipe\\otzar-mcp-test-${process.pid}`;
+m.deps.startLockName = () => TEST_LOCK;
 
 function fakeCdp(ua, port = 0) {
   return new Promise((ok) => {
@@ -75,7 +78,9 @@ test("a port on the command line that is not Otzar is never used", async () => {
   const chrome = await fakeCdp("Mozilla/5.0 Chrome/120.0");
   try {
     m.deps.otzarProcesses = () => [{ pid: 1, exe: "X:\\otzar.exe", cmd: `otzar.exe --remote-debugging-port=${chrome.address().port}` }];
-    await assert.rejects(m.ensureOtzar(), /open without the agent connection/);
+    // IT-781 (N2): a port on the command line that does not answer as Otzar is treated as an
+    // Otzar still loading (bounded wait), and is still never used.
+    await assert.rejects(m.ensureOtzar({ loadingWaitMs: 1500 }), (e) => e.message === m.MSG_STILL_LOADING);
     assert.equal(m.state.port, null);
   } finally { chrome.close(); }
 });
@@ -504,4 +509,250 @@ test("IT-779 launch --shortcut: other failures -> a Hebrew-only popup for a pers
   assert.equal(sh.popups.length, 2);
   assert.match(sh.popups[0], /לא נמצאה התקנה/); // "no install was found"
   for (const p of sh.popups) assert.doesNotMatch(p, /[A-Za-z]{3,}|Tell the user|retry/);
+});
+
+// =============================================================================================
+// IT-781: find_book, scoped search, hit context, references, and IT-779 review notes N1-N3
+// =============================================================================================
+const net = require("node:net");
+
+test("IT-781 route guard: api/books/data/<id> only on its own binary route, never through the JSON GET list", () => {
+  const DATA = [m.ROUTE_GET_DATA];
+  assert.equal(m.checkedPath("api/books/data/173917", DATA), "api/books/data/173917");
+  assert.throws(() => m.checkedPath("api/books/data/173917", GET), /internal:/);
+  for (const p of ["api/books/data/x", "api/books/data/1/2", "api/books/data/../1", "api/books/data/1?x=1",
+    "api/books/173917/tsiyunim", "api/books/data/1234567890123", "api/books/books_tsiyunim_fix", "api/books/tsiyunsDel"]) {
+    assert.throws(() => m.checkedPath(p, DATA), /internal:/, p);
+  }
+  // Nothing new was added to the JSON GET list or the POST route.
+  assert.equal(m.ROUTES_GET.length, 5);
+  for (const p of ["api/books/1/tsiyunim", "api/books/1/pages/2/tsiyunim", "api/books/data/1"]) assert.throws(() => m.checkedPath(p, GET), /internal:/, p);
+});
+
+test("IT-781: invalid arguments of the new tools are refused before any Otzar call", async () => {
+  reset();
+  let probed = 0, spawned = 0;
+  m.deps.otzarProcesses = () => { probed++; return []; };
+  m.deps.findInstall = () => ({ exe: "Z:\\Otzar\\launcher\\bin\\x64\\app\\otzar.exe", source: "test" });
+  m.deps.spawn = () => { spawned++; return { unref() {} }; };
+  const cases = [
+    ["search", { query: "x", book_ids: [] }, /^book_ids must be a list of 1 to 200/],
+    ["search", { query: "x", book_ids: "1,2" }, /^book_ids must be a list/],
+    ["search", { query: "x", book_ids: [1, "2; x"] }, /^book_ids must contain only integers/],
+    ["search", { query: "x", book_ids: [0] }, /^book_ids must contain only integers/],
+    ["search", { query: "x", book_ids: [1.5] }, /^book_ids must contain only integers/],
+    ["search", { query: "x", book_ids: Array.from({ length: 201 }, (_, i) => i + 1) }, /^book_ids must be a list of 1 to 200/],
+    ["find_book", {}, /^query is required/],
+    ["find_book", { query: "  " }, /^query is required/],
+    ["find_book", { query: "a\nb" }, /^query must be one line/],
+    ["find_book", { query: "x".repeat(201) }, /^query must be 1 to 200/],
+    ["find_book", { query: "x", limit: 0 }, /^limit must be an integer/],
+    ["get_hit_context", { book_id: 1, window: 101 }, /^window must be an integer/],
+    ["get_hit_context", { book_id: 1, max_hits: 51 }, /^max_hits must be an integer/],
+    ["get_hit_context", { book_id: 1, offset: -1 }, /^offset must be an integer/],
+    ["list_references", { book_id: 1, type: 3 }, /^type must be an integer/],
+    ["list_references", { book_id: 1, limit: 501 }, /^limit must be an integer/],
+    ["list_references", { book_id: 1, filter: "a\u0007" }, /^filter must be one line/],
+    ["go_to_reference", { book_id: 1 }, /^ref is required/],
+    ["go_to_reference", { book_id: 1, ref: " " }, /^ref is required/],
+    ["go_to_reference", { book_id: "1 OR 1", ref: "x" }, /^book_id must be an integer/],
+  ];
+  for (const [name, args, re] of cases) {
+    const r = await m.callTool(name, args);
+    assert.equal(r.isError, true, `${name} ${JSON.stringify(args)}`);
+    assert.match(r.content[0].text, re, `${name} ${JSON.stringify(args)}`);
+  }
+  assert.equal(probed, 0);
+  assert.equal(spawned, 0);
+});
+
+test("IT-781: book_ids are validated, digit strings become integers, duplicates dropped", () => {
+  const schema = m.TOOLS.find((t) => t.name === "search").inputSchema;
+  assert.deepEqual(m.validateArgs(schema, { query: "x", book_ids: [173917, "143562", 173917] }), { query: "x", book_ids: [173917, 143562] });
+});
+
+test("IT-781 find_book: a leading shut / sefer prefix is recognized for the retry; other text is not", () => {
+  for (const q of ["שו\"ת אגרות משה", "שו״ת אגרות משה", "שות אגרות משה", "ספר החינוך"]) assert.ok(m.BOOK_PREFIX_RE.test(q), q);
+  for (const q of ["אגרות משה", "שותפות", "ספרי", "|ספר:משנה ברורה|"]) assert.ok(!m.BOOK_PREFIX_RE.test(q), q);
+  assert.equal("שו\"ת אגרות משה".replace(m.BOOK_PREFIX_RE, ""), "אגרות משה");
+});
+
+// A Berachot-like book (type 2 per amud + type 1 headings) and a Mishna Berura-like one (type 1 only).
+const BERACHOT = {
+  refs: [["פסקי תוספות ברכות", 136, 1], ["ברכות ב א", 11, 2], ["ברכות ב ב", 12, 2], ["ברכות ג ב", 14, 2],
+    ["ברכות י א", 27, 2], ["ברכות סד א", 135, 2], ["פירוש הרמב\"ם למשנה ב א", 147, 1]],
+  pages: Array.from({ length: 150 }, (_, i) => [i + 1, `L${i + 1}`]),
+};
+const MB = {
+  refs: [["מפתחות", 2, 1], ["הקדמה", 6, 1], ["סימן א", 8, 1], ["סימן ב", 12, 1], ["סימן אב", 90, 1], ["סימן קכג", 300, 1]],
+  // page 300 is empty (filtered out): the next non-empty page is 302.
+  pages: [...Array.from({ length: 299 }, (_, i) => [i + 1, i === 7 ? "ד א" : `P${i + 1}`]), [302, "קנא א"]],
+};
+
+test("IT-781 refVariants/normTitle: gershayim, nikud, amud dots, the word daf", () => {
+  assert.deepEqual(m.refVariants("סימן קכ\"ג"), ["סימן קכג"]);
+  assert.deepEqual(m.refVariants("דף יג."), ["דף יג א", "יג א"]);
+  assert.deepEqual(m.refVariants("דף יג:"), ["דף יג ב", "יג ב"]);
+  assert.deepEqual(m.refVariants("דף יג עמוד ב"), ["דף יג ב", "יג ב"]);
+  assert.equal(m.normTitle("הִלְכוֹת  תְּשׁוּבָה"), "הלכות תשובה");
+});
+
+test("IT-781 go_to_reference: type 2 first, suffix match for Shas, next_reference", () => {
+  const r = m.findReference(BERACHOT, "ב א");
+  assert.equal(r.found, true);
+  assert.equal(r.matched_title, "ברכות ב א"); // not the type-1 title that also ends with "ב א"
+  assert.equal(r.type, 2);
+  assert.equal(r.match, "suffix");
+  assert.equal(r.page, 11);
+  assert.equal(r.page_label, "L11");
+  assert.deepEqual(r.next_reference, { title: "ברכות ב ב", page: 12, page_label: "L12" });
+  assert.equal(m.findReference(BERACHOT, "דף ג:").matched_title, "ברכות ג ב");
+  assert.equal(m.findReference(BERACHOT, "ברכות סד א").match, "exact");
+});
+
+test("IT-781 go_to_reference: exact / whole word before substring (siman alef is not siman alef-bet)", () => {
+  const r = m.findReference(MB, "סימן א");
+  assert.equal(r.matched_title, "סימן א");
+  assert.equal(r.match, "exact");
+  assert.equal(r.page, 8);
+  assert.equal(r.page_label, "ד א");
+  assert.deepEqual(r.next_reference, { title: "סימן ב", page: 12, page_label: "P12" });
+  assert.ok(r.candidates.some((c) => c.title === "סימן אב" && c.match === "substring"));
+  assert.equal(m.findReference(MB, "סימן קכ\"ג").matched_title, "סימן קכג");
+});
+
+test("IT-781 go_to_reference: a tsiyun on an empty page goes to the next non-empty page; label fallback; not found", () => {
+  const r = m.findReference(MB, "סימן קכג");
+  assert.equal(r.page, 302);
+  assert.equal(r.page_label, "קנא א");
+  assert.equal(r.next_reference, null);
+  const noIndex = { refs: [], pages: [[1, "א"], [2, "יג א"], [3, "יג ב"]] };
+  assert.deepEqual([m.findReference(noIndex, "דף יג").page, m.findReference(noIndex, "יג ב").page], [2, 3]);
+  assert.equal(m.findReference(noIndex, "יג ב").match, "page_label");
+  assert.equal(m.findReference(MB, "פרק ט").found, false);
+});
+
+test("IT-781 list_references: type 2 by default when the book has it, filter, paging", () => {
+  const a = m.listReferences(BERACHOT, { limit: 2, offset: 0 });
+  assert.deepEqual(a.type_counts, { catalogue: 5, headings: 2 });
+  assert.equal(a.type_shown, 2);
+  assert.equal(a.total_matching, 5);
+  assert.deepEqual(a.references, [{ title: "ברכות ב א", page: 11, page_label: "L11" }, { title: "ברכות ב ב", page: 12, page_label: "L12" }]);
+  assert.equal(a.next_offset, 2);
+  const b = m.listReferences(MB, { filter: "סימן", limit: 100, offset: 0 });
+  assert.equal(b.type_shown, "all");
+  assert.deepEqual(b.references.map((x) => x.title), ["סימן א", "סימן ב", "סימן אב", "סימן קכג"]);
+  assert.equal(b.references[0].type, 1);
+  assert.equal(b.next_offset, null);
+  assert.equal(m.listReferences(BERACHOT, { type: 1, limit: 10, offset: 0 }).total_matching, 2);
+});
+
+test("IT-781 hit context: window inside a page, across the previous page, cut at short pages, 200-word reads", () => {
+  // pages of 100 words each, one part per page; page 3 has only 5 words.
+  const pages = [[1, 0, 100], [2, 100, 100], [3, 200, 5], [4, 205, 300]].map(([position, firstWord, numWords]) =>
+    ({ position, pagedata: [{ firstWord, numWords, letter: String(position) }] }));
+  const segs = m.pageSegments(pages);
+  let p = m.planHitWindow(segs, [150], 10);
+  assert.deepEqual(p.ranges.map((r) => [r.seg, r.start, r.n]), [[1, 140, 21]]);
+  assert.equal(p.cut, false);
+  p = m.planHitWindow(segs, [103, 104], 10); // starts 3 words into page 2: 7 words from page 1
+  assert.deepEqual(p.ranges.map((r) => [r.seg, r.start, r.n]), [[0, 93, 7], [1, 100, 15]]);
+  assert.equal(p.seg, 1);
+  assert.equal(p.cut, false);
+  p = m.planHitWindow(segs, [2], 10); // book start
+  assert.deepEqual(p.ranges.map((r) => [r.seg, r.start, r.n]), [[0, 0, 13]]);
+  assert.equal(p.cut, false, "the book start is not a cut: there are no words before it");
+  p = m.planHitWindow(segs, [210], 20); // page 3 (5 words) between: only one neighbour page is read
+  assert.deepEqual(p.ranges.map((r) => [r.seg, r.start, r.n]), [[2, 200, 5], [3, 205, 26]]);
+  assert.equal(p.cut, true);
+  p = m.planHitWindow(segs, [300, 302, 400, 403, 450], 100); // a long hit group: reads split at 200
+  assert.ok(p.ranges.every((r) => r.n <= 200));
+  assert.equal(p.ranges.reduce((a, r) => a + r.n, 0), 305); // 5 words of page 3 + the 300 of page 4
+  assert.equal(p.cut, false, "the book's end is not a cut");
+  assert.equal(m.planHitWindow(segs, [9999], 5), null);
+});
+
+test("IT-781 hit context: hit words in guillemets, a page change marked, nearest word when the index has no word", () => {
+  const P1 = {}, P2 = {};
+  const t = m.hitText([{ page: P1, list: [{ w: "א", abs: 98 }, { w: "ב", abs: 99 }] },
+    { page: P2, list: [{ w: "ג", abs: 100 }, { w: "ד", abs: 101 }, { w: "ה", abs: 102 }] }], [100, 101]);
+  assert.equal(t, "א ב ‖ «ג» «ד» ה");
+  assert.equal(m.hitText([{ page: P1, list: [{ w: "א", abs: 5 }, { w: "ב", abs: 8 }] }], [6]), "א «ב»");
+  assert.deepEqual(m.groupOffsets([1, 2, 3, 10, 12, 30]), [[1, 2, 3], [10, 12], [30]]);
+});
+
+// ---- IT-779 review notes, fixed in IT-781 ----
+const freeLoopbackPort = () => new Promise((ok) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => ok(p)); }); });
+
+test("IT-781 N3: debugging ports are matched exactly (6056 is not 60568)", async () => {
+  assert.deepEqual(m.cmdPorts([{ cmd: "otzar.exe --remote-debugging-port=60568" }, { cmd: "x --remote-debugging-port=6056 --y" }, { cmd: "" }]), [60568, 6056]);
+  assert.deepEqual(m.cmdPorts([{ cmd: "otzar.exe --remote-debugging-port=123456" }]), []);
+  reset();
+  const mc = fakeMachine();
+  m.state.lastStartPort = 6056;
+  m.state.noAnswer = true;
+  mc.extra = { pid: 9, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=60568` }; // someone else's, not answering
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false, loadingWaitMs: 1200 }), (e) => e.message === m.MSG_STILL_LOADING);
+  assert.equal(mc.spawns, 0);
+});
+
+test("IT-781 N2: an Otzar opened by another launch is still loading -> wait for it, no second start, no 'close it' message", async () => {
+  reset();
+  const mc = fakeMachine();
+  const port = await freeLoopbackPort();
+  mc.extra = { pid: 88, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${port}` };
+  let late = null;
+  setTimeout(() => fakeCdp(UA_OTZAR, port).then((s) => { late = s; }), 1500); // answers after 1.5 s
+  try {
+    assert.equal(await m.ensureOtzar({ waitForWindow: false, loadingWaitMs: 8000 }), port);
+    assert.equal(mc.spawns, 0);
+  } finally { if (late) await closeSrv(late); }
+});
+
+test("IT-781 N2: launch --shortcut while another start is loading -> waits, brings it to the front, no popup", async () => {
+  reset();
+  const sh = fakeShell();
+  const mc = fakeMachine();
+  const port = await freeLoopbackPort();
+  mc.extra = { pid: 99, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${port}` };
+  let late = null;
+  setTimeout(() => fakeCdp(UA_OTZAR, port).then((s) => { late = s; }), 1500);
+  try {
+    assert.equal(await m.launchFromShortcut(), 0);
+    assert.equal(mc.spawns, 0);
+    assert.deepEqual(sh.activated, [[99]]);
+    assert.equal(sh.popups.length, 0);
+  } finally { if (late) await closeSrv(late); }
+});
+
+test("IT-781 N2: the start lock is held by one process at a time; a second launch waits for it and then connects instead of starting", async () => {
+  const a = await m.tryLock(TEST_LOCK);
+  assert.ok(a, "first lock");
+  assert.equal(await m.tryLock(TEST_LOCK), null, "a second holder is refused by Windows");
+  // Another launcher (simulated by `a`) is starting Otzar. While it holds the lock, this one waits.
+  reset();
+  const mc = fakeMachine();
+  let user = null;
+  setTimeout(async () => {
+    user = await fakeCdp(UA_OTZAR);
+    mc.extra = { pid: 7, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${user.address().port}` };
+    a.close(); // the other launcher is done: its Otzar answers
+  }, 1200);
+  const t0 = Date.now();
+  try {
+    const port = await m.ensureOtzar({ waitForWindow: false });
+    assert.ok(Date.now() - t0 >= 1000, "waited for the lock");
+    assert.equal(port, user.address().port);
+    assert.equal(mc.spawns, 0, "no second Otzar");
+  } finally { if (user) await closeSrv(user); }
+  const again = await m.tryLock(TEST_LOCK);
+  assert.ok(again, "the lock was released after the call");
+  again.close();
+});
+
+test("IT-781 N1: the shortcut popup is not closed after 30 s; the loading message is Hebrew only", () => {
+  assert.ok(m.POPUP_TIMEOUT_MS >= 60 * 60_000);
+  const t = m.shortcutPopupText(new m.UserError(m.MSG_STILL_LOADING));
+  assert.match(t, /עדיין נפתח/);
+  assert.doesNotMatch(t, /[A-Za-z]{3,}/);
 });

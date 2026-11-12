@@ -51,12 +51,27 @@ Lets an AI agent (Claude Desktop, Claude Code, or any MCP client) search and rea
 
 ## Tools
 
-`status`, `search`, `search_hits`, `get_page_text`, `get_page_image`, `book_info`. See the skill for how to use them.
+`status`, `search`, `search_hits`, `get_hit_context`, `get_page_text`, `get_page_image`, `book_info`, `find_book`, `list_references`, `go_to_reference`. See the skill for how to use them.
+
+| Tool | What it does | Changes Otzar's window? |
+|---|---|---|
+| `find_book` | Finds books by name with Otzar's own book-name search (F2), in memory. Supports `name  reference` (two spaces) and `\|ספר:..&מחבר:..&מקום:..&שנה:..\|`. A leading `שו"ת` / `שות` / `ספר` that finds fewer than 3 books is dropped and the search repeated (the result says so). Returns `volume_ids` for a multi-volume set. | No (no search, no history) |
+| `search` with `book_ids` | Full-text search only in the given books (1 to 200), through Otzar's own search method. | Yes, like any `search` |
+| `get_hit_context` | Each hit of the current search in one book, with only N words around it (default 15). Hit words in «», a page change marked ‖. Pages with `offset`. | No |
+| `list_references` | The book's index (ציונים): siman, daf/amud, perek/halacha, with the page each starts on. | No |
+| `go_to_reference` | The page where a siman/daf/halacha starts, from that index, and where the next one starts. | No |
+
+Example of checking a citation: `find_book "אגרות משה"` → `go_to_reference 107416 "סימן קכג"` → `get_page_text 107416 page 204`.
 
 ## Notes
 
-- `search` types into Otzar's own search panel: the user sees the agent's searches there, each one replaces the search on screen, and Otzar adds each one to its search history. A search started while Otzar is busy waits for the running search to finish; a search replaced by another one returns an error, never the other search's results.
+- `search` types into Otzar's own search panel: the user sees the agent's searches there, each one replaces the search on screen, and Otzar adds each one to its search history.
+  - A search with `book_ids` is limited to those books, but Otzar saves it in its search history as an empty line: the entry has no search text and no book list (tested live). The results are still correct. The tool does not touch Otzar's scope combo.
+  - In Otzar's "special" search type, a book list is not supported, so a search with `book_ids` is refused with a clear message.
+- `find_book`, `get_hit_context`, `list_references` and `go_to_reference` only read. The index tools read Otzar's book index (`api/books/data/<id>`), the same data the reader loads when a book is opened.
+- Two starts close together (two clicks on the shortcut, or the shortcut and an agent) are serialized by a lock of this user (a named pipe that accepts no connection, not a network port). The second one waits, then connects to the Otzar the first one opened, and does not start another one. An Otzar that is still loading is waited for instead of being reported as "open without the connection".
+- The shortcut's message box stays until it is closed (it used to close itself after 30 seconds). A search started while Otzar is busy waits for the running search to finish; a search replaced by another one returns an error, never the other search's results.
 - License packages differ between users, so a book that one user has may be missing for another.
-- While Otzar runs with the debugging port, any program on this PC can control it. The port listens on 127.0.0.1 only. The MCP server itself opens no port at all (stdio only).
+- While Otzar runs with the debugging port, any program on this PC can control it. The port listens on 127.0.0.1 only. The MCP server itself opens no network port at all (stdio only; the start lock is a local named pipe that refuses every connection).
 - The exe is unsigned: the signature of the node.exe it is built from is removed during the build. Windows SmartScreen may warn the first time it runs.
 - Network stations are not supported (untested).
