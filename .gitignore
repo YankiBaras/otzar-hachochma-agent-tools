@@ -3,6 +3,8 @@
 
 # Build output (about 90 MB). Rebuild with package/build.ps1; publish as a release asset, not in git.
 /package/dist/
+# IT-780: responsa-mcp build output (rebuild with responsa/build.ps1).
+/responsa/dist/
 
 node_modules/
 *.log
