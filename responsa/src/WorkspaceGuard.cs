@@ -1,4 +1,5 @@
-// IT-780 (reviews 1 and 2, finding 1): protects the editor's workspace autosave file (DATA\responsaext1.029).
+// IT-780 (reviews 1 and 2, finding 1): protects the editor's workspace autosave file (DATA\responsaext1.029 on
+// Responsa 29). IT-785: the caller finds the file by name (WorkspaceFile in Instance.cs) and passes its path.
 //
 // Responsa writes this file every few minutes (autosave) and on a normal exit, and reopens its windows from it on
 // the next start. The tool's instance writes it too. Rules:
@@ -321,6 +322,14 @@ namespace ResponsaMcp
             if (kv == null || !kv.TryGetValue("file", out f) || !kv.TryGetValue("kept", out kept)) return KeepAside(guardDir, id);
             if (HashOf(f) == kept) { TryDelete(bak); TryDelete(meta); return null; }
             return KeepAside(guardDir, id);
+        }
+
+        /// <summary>IT-785: the workspace file another guard protects (from its meta file); null if it cannot be read now.</summary>
+        public static string FileOf(string guardDir, string id)
+        {
+            var kv = ReadMeta(Path.Combine(guardDir, id + ".meta"));
+            string f;
+            return kv != null && kv.TryGetValue("file", out f) && f.Length > 0 ? f : null;
         }
 
         /// <summary>Kept-aside copies in guardDir, as paths to report.</summary>

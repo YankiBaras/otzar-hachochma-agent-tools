@@ -65,6 +65,7 @@ namespace ResponsaMcp
             var o = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
             try
             {
+                o.WriteLine("install: " + McpServer.Serialize(Tools.Installation()));   // IT-785: before the instance starts
                 o.WriteLine("status: " + McpServer.Serialize(tools.Status()));
                 o.WriteLine("search: " + McpServer.Serialize(tools.Search(query, 1, 3, 180)));
                 o.WriteLine("open_text: " + Trim(McpServer.Serialize(tools.OpenText("בבלי ברכות ב א", 600, 30))));

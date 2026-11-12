@@ -91,7 +91,7 @@ namespace ResponsaMcp
             {
                 var r = new Dictionary<string, object>();
                 r["responsa_exe"] = inst.Install.Exe;
-                r["responsa_version"] = inst.Install.Version;
+                foreach (var kv in VersionReport(inst.Install, inst.Workspace)) r[kv.Key] = kv.Value;
                 r["data_folder"] = inst.Install.DataDir;
                 r["instance_pid"] = (long)inst.Pid;
                 r["private_desktop"] = ui.DesktopName;
@@ -102,6 +102,40 @@ namespace ResponsaMcp
                 if (kept.Count > 0) r["kept_workspace_backups"] = kept;
                 return (object)r;
             });
+        }
+
+        /// <summary>
+        /// IT-785: the Responsa version and the workspace file, without starting the instance (used by `doctor`, so it is
+        /// shown even when the instance cannot start).
+        /// </summary>
+        public static Dictionary<string, object> Installation()
+        {
+            var ins = Install.Find();
+            var r = new Dictionary<string, object>();
+            r["responsa_exe"] = ins.Exe;
+            foreach (var kv in VersionReport(ins, WorkspaceFile.Find(ins.DataDir, ins.Major))) r[kv.Key] = kv.Value;
+            r["data_folder"] = ins.DataDir;
+            return r;
+        }
+
+        /// <summary>IT-785: version, whether it was tested, and the workspace file (found, none or several).</summary>
+        public static Dictionary<string, object> VersionReport(Install ins, WorkspaceFile ws)
+        {
+            var r = new Dictionary<string, object>();
+            r["responsa_version"] = ins.Version;
+            bool tested = ins.Major == WorkspaceFile.TestedMajor;
+            r["version_tested"] = tested;
+            if (!tested)
+                r["version_note"] = "responsa-mcp was tested on Responsa " + WorkspaceFile.TestedMajor + " only. This version is not tested yet: it is not refused, but report any problem.";
+            if (ws == null) return r;
+            if (ws.State == "found") r["workspace_file"] = ws.Path;
+            else if (ws.State == "none") r["workspace_file"] = "none yet (protected as a new file: " + ws.Path + ")";
+            else
+            {
+                r["workspace_file"] = "several";
+                r["workspace_files"] = ws.Matches.Cast<object>().ToList();
+            }
+            return r;
         }
 
         // ------------------------------------------------------------------ search

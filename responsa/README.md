@@ -10,7 +10,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
   - Responsa's own File → Save, which writes Unicode text to the tool's temp folder; the tool reads the file and deletes it
 - It never reads Responsa's content files (the books and their indexes) and never drives or ends the user's Responsa. It reads two small files:
   - `Responsa.env`, to find the data folder
-  - the workspace autosave `DATA\responsaext1.029`, which it copies, compares and may put back (see below)
+  - the workspace autosave `DATA\responsaext1.029` (on Responsa 29; see "Responsa versions" below), which it copies, compares and may put back
 - It changes no option through Responsa's Options dialog. It does switch its own instance to advanced search and may tick "search all databases"; Responsa keeps such choices in its workspace autosave, which the tool protects.
 - It is a single exe with nothing to install. It is built with the C# compiler that ships with Windows (.NET Framework 4.x), as x86 to match Responsa. MCP runs over stdio only, with no network port.
 
@@ -25,7 +25,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
      { "mcpServers": { "responsa": { "command": "C:\\Users\\<you>\\AppData\\Local\\ResponsaMcp\\bin\\responsa-mcp.exe" } } }
      ```
 4. Install the skill: copy `skill\responsa` to `%USERPROFILE%\.claude\skills\`, or upload it as a skill in Claude.
-5. Check: `responsa-mcp.exe doctor` starts the private instance, runs a control search, opens one text and stops. It takes about 15 seconds.
+5. Check: `responsa-mcp.exe doctor` first prints the Responsa version and the workspace file it found (`install:`), then starts the private instance, runs a control search, opens one text and stops. It takes about 15 seconds.
 
 The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs Responsa.
 
@@ -33,7 +33,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 
 | Tool | Does |
 |---|---|
-| `status` | Starts the private instance if needed; reports install, version and open searches. |
+| `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), the workspace file it protects (`workspace_file`) and open searches. |
 | `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. |
 | `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. |
 | `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. |
@@ -42,7 +42,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 ## What it leaves behind, and what it protects
 
 - **Search history:** the agent's searches go into Responsa's former-queries list (`DATA\responsahst.029`), and opened texts into the former-texts list (`responsahis.029`). These lists are shared with the user's Responsa; that is how Responsa works.
-- **Workspace autosave (`DATA\responsaext1.029`).** Responsa writes this file every few minutes and when it exits normally, and reopens those windows on the next start. The tool's instance writes it too. The tool keeps the user's version safe as follows:
+- **Workspace autosave (`DATA\responsaext1.029` on Responsa 29).** Responsa writes this file every few minutes and when it exits normally, and reopens those windows on the next start. The tool's instance writes it too. The tool keeps the user's version safe as follows:
   - **Before start:** the tool keeps a copy of the user's version, one copy per server and per instance (`%LOCALAPPDATA%\ResponsaMcp\workspace\`). A crash, a restart or another server never overwrites it.
   - **A second server** (another MCP client) never copies the file as it is on disk while another server's instance is alive, because that instance may have just written it. It takes that server's copy instead, so all servers put back the same bytes. If two live servers keep different copies, a third does not start its instance and says so.
   - **While its instance is alive:** the tool checks the file every 1.5 s and whether the user's Responsa is running.
@@ -54,7 +54,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
   - **When the tool's instance ends,** and **at the next server start for a server that died:** the copy is removed only if the workspace file equals it. Otherwise the tool writes nothing to the workspace file. It keeps the copy intact as `*.kept.bak` (with `*.kept.meta`) and lists it under `kept_workspace_backups` in `status`, so it can be restored by hand.
     - This happens, for example, when the server is killed after the tool's instance autosaved while the user's Responsa was open, or when the instance ends while the user's Responsa is open and the file changed.
     - Kept copies are never deleted by the tool. They are small (a few KB to a few hundred KB) and can be deleted by hand once the user's Responsa shows the right windows.
-  - **To restore a kept copy by hand:** close every Responsa, then copy the `*.kept.bak` file over `DATA\responsaext1.029` in the data folder.
+  - **To restore a kept copy by hand:** close every Responsa, then copy the `*.kept.bak` file over the workspace file named in `status` (`DATA\responsaext1.029` on Responsa 29). The `file=` line of the `*.kept.meta` next to it names the file it was kept from.
   - **Residual case:** after the user's Responsa crashes during an overlap in which the tool's instance autosaved, the next Responsa the user opens may show the tool's windows. The user's previous layout is not lost: it is the kept copy listed in `status`.
   - **At start:** the tool closes any windows its instance restored from the file.
 - **Ending the instance:** the tool terminates its own process through the handle it got when starting it, so its PID is never confused with a reused one. There is no Responsa exit routine, so Responsa's exit save of its settings never overwrites the user's. The instance record and the copy are released only after the process has actually exited. If it does not exit within 15 s, everything is kept and no new instance is started. At start-up Responsa itself adds a `Report=` key to `Responsa.ini`.
@@ -69,7 +69,18 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 - Per call: at most 50 results and 60,000 characters of text. Extraction is meant to be small and per question.
 - Responsa refuses searches with more than 32,000 results.
 - One search at a time per server. Each MCP client process gets its own private instance.
-- Tested on Responsa 29.0 (ResponsaCD29C, "29 ragil DISKLESS") on Windows 11.
+- Tested on Responsa 29.0 (ResponsaCD29C, "29 ragil DISKLESS") on Windows 11. Other versions: see below.
+
+## Responsa versions
+
+- **Tested:** Responsa 29 only. On that version every data file ends in `.029`, so the suffix is taken to be the version number. That is an inference, not checked on another version.
+- **Other versions are not refused.** `status` and `doctor` show `version_tested: false` and a note. Search, `open_text` and the window commands are expected to work unchanged, because versions differ in content; that is not tested yet.
+- **Which workspace file is protected:** the tool looks in `DATA\` for `responsaext1.0NN` (three digits, the first `0`; a longer name such as `responsaext1.029_` does not count). It decides once, each time its instance starts:
+  - **One such file:** that file is protected, as described above.
+  - **None:** the name this version is expected to create (`responsaext1.030` for Responsa 30; `.029` if the version cannot be read) is protected as a file that did not exist before, so a file only the tool's instance creates there is removed.
+  - **Several** (for example `.029` and `.030` left by an upgrade): the tool does not guess. It does not start its instance and returns an error naming the files. The user can move the file of a version that is no longer installed out of `DATA\`, with every Responsa closed.
+  - **Two servers that found different files** (one started before the file appeared): the second does not start its instance until the first has stopped.
+- **To see what the tool uses:** `responsa-mcp.exe doctor` prints `responsa_version`, `version_tested` and `workspace_file` before it starts anything; `status` shows the same.
 
 ## Development
 
@@ -77,7 +88,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
   - `Program.cs`: entry point and tool definitions
   - `Mcp.cs`: JSON-RPC and argument validation
   - `Tools.cs`: tools and caps
-  - `Instance.cs`: install discovery, lifecycle, orphans
+  - `Instance.cs`: install discovery, the workspace file (`WorkspaceFile`, IT-785), lifecycle, orphans
   - `WorkspaceGuard.cs`: workspace protection
   - `Proc.cs`: process identity (handle + creation time)
   - `Ui.cs`: Responsa UI operations and the measured command/control IDs

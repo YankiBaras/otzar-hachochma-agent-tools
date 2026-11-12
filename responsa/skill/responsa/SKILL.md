@@ -92,3 +92,9 @@ Rules:
 - **Automatic restart.** If an operation gets stuck (a search that does not finish within `timeout_sec`, a window that does not open), or Responsa shows an internal error or an unknown window, the tool restarts its private instance at once. The error message then ends with "The private Responsa instance was restarted; try again."
   - Earlier `search_id`s are gone after a restart: search again.
   - Give slow searches a larger `timeout_sec` rather than retrying with a small one.
+- **"several workspace files":** Responsa's data folder holds workspace files of more than one version (for example `responsaext1.029` and `responsaext1.030`), and the tool does not start rather than guess. Do not retry. Tell the user the file names from the error; they can move the one of a version that is no longer installed out of the `DATA` folder, with every Responsa closed.
+
+## Responsa versions
+
+- The tools were tested on Responsa 29. Other versions are not refused; `status` shows `responsa_version` and `version_tested`. When `version_tested` is false, the query syntax and references above are expected to work, but say so if something behaves unlike this skill.
+- `status` also shows `workspace_file`: the workspace autosave the tool protects. The user can run `responsa-mcp.exe doctor` to see the same before anything starts.

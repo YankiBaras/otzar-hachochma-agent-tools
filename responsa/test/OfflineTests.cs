@@ -28,6 +28,7 @@ namespace ResponsaMcp
             ProtocolTests();
             ParseTests(samples);
             WorkspaceGuardTests();
+            WorkspaceFileTests();
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
             Check(Ui.FixBidi("תלמוד בבלי") == "תלמוד בבלי", "FixBidi plain");
             Check(McpServer.Serialize(new Dictionary<string, object> { { "t", "גמ' <a> & b" } }) == "{\"t\":\"גמ' <a> & b\"}", "Serialize keeps ' < > & plain");
@@ -295,6 +296,121 @@ namespace ResponsaMcp
                 w.Running.Add("ed1"); g.Tick();
                 File.WriteAllText(ws, "E1"); kept = g.End();
                 Check(Read(ws) == "E1" && kept != null && File.ReadAllText(kept) == "E0", "end with the editor open: its save stays, the older copy is kept aside");
+            }
+            finally { try { Directory.Delete(root, true); } catch { } }
+        }
+
+        // ---- IT-785: the workspace file is found by name (Responsa versions other than 29)
+        static void WorkspaceFileTests()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "responsa-wsfile-test-" + Guid.NewGuid().ToString("N"));
+            string data = Path.Combine(root, "DATA"), gdir = Path.Combine(root, "guards");
+            Directory.CreateDirectory(data);
+            try
+            {
+                // Files that are not the workspace file never match.
+                foreach (var n in new[] { "responsahst.030", "responsaext1.029_", "responsaext1.029__", "responsaext1.29", "responsaext1.0299", "responsaext2.030", "responsaext1.0a9", "xresponsaext1.030" })
+                    File.WriteAllText(Path.Combine(data, n), "x");
+
+                // No match: the name this version is expected to create, protected as a file that did not exist.
+                var none = WorkspaceFile.Find(root, 30);
+                Check(none.State == "none" && none.Matches.Count == 0 && Path.GetFileName(none.Path) == "responsaext1.030", "none: expected name from the version (30 -> .030)");
+                Check(Path.GetFileName(WorkspaceFile.Find(root, 0).Path) == "responsaext1.029", "none, version unknown: .029");
+                Check(Path.GetFileName(WorkspaceFile.Find(root, 29).Path) == "responsaext1.029", "none on 29: today's name");
+                var gNone = new WorkspaceGuard(none.Path, gdir, "n1", new FakeWorld()); gNone.Begin();
+                File.WriteAllText(none.Path, "T1"); gNone.Tick();
+                Check(!File.Exists(none.Path) && gNone.End() == null, "none: a file the tool creates is removed");
+
+                // One match with a suffix other than .029 (any case): that file is protected, exactly as before.
+                string ws30 = Path.Combine(data, "RESPONSAEXT1.030");
+                File.WriteAllText(ws30, "E0");
+                var one = WorkspaceFile.Find(root, 30);
+                Check(one.State == "found" && one.Matches.Count == 1 && string.Equals(one.Path, ws30, StringComparison.OrdinalIgnoreCase), "one match .030: found");
+                Check(WorkspaceFile.Find(root, 29).Path == one.Path, "one match is used even when the version differs");
+                var g = new WorkspaceGuard(one.Path, gdir, "o1", new FakeWorld()); g.Begin();
+                File.WriteAllText(ws30, "T1"); g.Tick();
+                Check(File.ReadAllText(ws30) == "E0" && g.End() == null && !Directory.GetFiles(gdir, "o1.*").Any(), "one match .030: the tool's write is put back, guard files removed");
+                Check(WorkspaceGuard.FileOf(gdir, "o1") == null, "FileOf: no meta -> null");
+
+                // Several matches: no path, and an error that names the files.
+                File.WriteAllText(Path.Combine(data, "responsaext1.029"), "E9");
+                var several = WorkspaceFile.Find(root, 29);
+                Check(several.State == "several" && several.Path == null && several.Matches.Count == 2, "several: no path");
+                string err = several.SeveralError();
+                Check(err.Contains("responsaext1.029") && err.Contains("RESPONSAEXT1.030") && err.Contains("does not start"), "several: the error names the files");
+                Check(File.ReadAllText(ws30) == "E0" && File.ReadAllText(Path.Combine(data, "responsaext1.029")) == "E9", "several: nothing written");
+
+                // The version report.
+                var ins29 = new Install { Version = "29.0.0.0", Major = 29 };
+                var rep = Tools.VersionReport(ins29, several);
+                Check((bool)rep["version_tested"] && !rep.ContainsKey("version_note") && (string)rep["workspace_file"] == "several" && ((List<object>)rep["workspace_files"]).Count == 2, "report: 29 tested, several files listed");
+                rep = Tools.VersionReport(new Install { Version = "30.0.0.0", Major = 30 }, one);
+                Check(!(bool)rep["version_tested"] && ((string)rep["version_note"]).Contains("not tested yet") && (string)rep["workspace_file"] == one.Path, "report: 30 not tested (not refused), file shown");
+                rep = Tools.VersionReport(ins29, none);
+                Check(((string)rep["workspace_file"]).StartsWith("none"), "report: none");
+
+                // A record written by IT-780 (fixed name, the meta lines of that version) still settles by its own path.
+                string old029 = Path.Combine(data, "responsaext1.029");
+                File.WriteAllText(Path.Combine(gdir, "780.bak"), "E9");
+                File.WriteAllLines(Path.Combine(gdir, "780.meta"), new[] { "existed=True", "kept=" + WorkspaceGuard.HashOf(Path.Combine(gdir, "780.bak")), "last=x", "file=" + old029 });
+                Check(WorkspaceGuard.FileOf(gdir, "780") == old029, "FileOf reads an IT-780 meta");
+                Check(WorkspaceGuard.SettleOrphan(gdir, "780") == null && !Directory.GetFiles(gdir, "780.*").Any(), "IT-780 record, file unchanged: settled and removed");
+                File.WriteAllText(Path.Combine(gdir, "781.bak"), "E8");
+                File.WriteAllLines(Path.Combine(gdir, "781.meta"), new[] { "existed=True", "kept=" + WorkspaceGuard.HashOf(Path.Combine(gdir, "781.bak")), "last=x", "file=" + old029 });
+                string kept = WorkspaceGuard.SettleOrphan(gdir, "781");
+                Check(kept != null && File.ReadAllText(kept) == "E8" && File.ReadAllText(old029) == "E9" && File.ReadAllText(ws30) == "E0", "IT-780 record, file changed: kept aside, no workspace file written");
+                Check(WorkspaceGuard.KeptAside(gdir).Contains(kept), "IT-780 record: kept copy listed for status");
+            }
+            finally { try { Directory.Delete(root, true); } catch { } }
+            StartGuardTests();
+        }
+
+        // ---- IT-785 review round 1: a live guard of another file, or one whose meta cannot be read, stops the start
+        // before Begin (Begin would adopt its "did not exist" state, and PutBack would delete the file found here).
+        static void StartGuardTests()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "responsa-startguard-test-" + Guid.NewGuid().ToString("N"));
+            string data = Path.Combine(root, "DATA"), gdir = Path.Combine(root, "guards");
+            Directory.CreateDirectory(data); Directory.CreateDirectory(gdir);
+            string ws29 = Path.Combine(data, "responsaext1.029"), ws30 = Path.Combine(data, "responsaext1.030");
+            try
+            {
+                File.WriteAllText(ws29, "E9");
+                string found = WorkspaceFile.Find(root, 30).Path;
+                Check(found == ws29, "startguard: this server found .029");
+                // Server A started with no match and protects .030 as a file that did not exist.
+                File.WriteAllLines(Path.Combine(gdir, "a.meta"), new[] { "existed=False", "kept=" + WorkspaceGuard.Absent, "last=" + WorkspaceGuard.Absent, "file=" + ws30 });
+                var w = new FakeWorld(); w.Others.Add("a");
+                Func<string, bool> untouched = id => File.ReadAllText(ws29) == "E9" && !Directory.GetFiles(gdir, id + ".*").Any();
+
+                // A readable meta with a different file= refuses.
+                Throws(() => Instance.StartGuard(found, gdir, "b1", w, null, 3, 10), "protects the workspace file", "startguard: different file= refuses");
+                Check(untouched("b1"), "startguard: different file=: no Begin, .029 unchanged");
+
+                // A meta that stays unreadable refuses after every attempt.
+                int calls = 0;
+                Throws(() => Instance.StartGuard(found, gdir, "b2", w, id => { calls++; return null; }, 3, 10), "could not read", "startguard: unreadable meta refuses");
+                Check(calls == 3 && untouched("b2"), "startguard: unreadable: read 3 times, no Begin, .029 unchanged");
+
+                // The real reader on a meta held open without sharing (as while it is being replaced) refuses too.
+                using (new FileStream(Path.Combine(gdir, "a.meta"), FileMode.Open, FileAccess.Read, FileShare.None))
+                    Throws(() => Instance.StartGuard(found, gdir, "b3", w, null, 3, 10), "could not read", "startguard: locked meta refuses");
+                Check(untouched("b3"), "startguard: locked meta: no Begin, .029 unchanged");
+
+                // First read fails, a later one succeeds and names another file: refuses.
+                calls = 0;
+                Throws(() => Instance.StartGuard(found, gdir, "b4", w, id => ++calls < 2 ? null : WorkspaceGuard.FileOf(gdir, id), 3, 10), "protects the workspace file", "startguard: fail then different file refuses");
+                Check(calls == 2 && untouched("b4"), "startguard: fail then different: no Begin, .029 unchanged");
+
+                // First read fails, a later one succeeds and names the same file: the start goes on and Begin shares its copy.
+                File.WriteAllText(Path.Combine(gdir, "s.bak"), "E9");
+                File.WriteAllLines(Path.Combine(gdir, "s.meta"), new[] { "existed=True", "kept=" + WorkspaceGuard.HashOf(ws29), "last=" + WorkspaceGuard.HashOf(ws29), "file=" + ws29 });
+                var ws = new FakeWorld(); ws.Others.Add("s");
+                calls = 0;
+                var g = Instance.StartGuard(found, gdir, "b5", ws, id => ++calls < 2 ? null : WorkspaceGuard.FileOf(gdir, id), 3, 10);
+                Check(calls == 2 && File.Exists(Path.Combine(gdir, "b5.meta")), "startguard: fail then same file: started");
+                File.WriteAllText(ws29, "T1"); g.Tick();
+                Check(File.ReadAllText(ws29) == "E9" && g.End() == null, "startguard: same file: tool write put back, ends clean");
             }
             finally { try { Directory.Delete(root, true); } catch { } }
         }

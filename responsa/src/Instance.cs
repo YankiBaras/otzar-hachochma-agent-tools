@@ -1,9 +1,10 @@
-// IT-780: finding Responsa, and the lifecycle of the tool's own instance on the private desktop.
+// IT-780, IT-785: finding Responsa, and the lifecycle of the tool's own instance on the private desktop.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Win32;
 
@@ -15,6 +16,7 @@ namespace ResponsaMcp
         public string Dir;       // program folder
         public string DataDir;   // folder holding Responsa.ini and DATA\
         public string Version;   // file version
+        public int Major;        // major part of the file version (29 for Responsa 29); 0 if it could not be read
 
         /// <summary>Finds the installation: RESPONSA_MCP_EXE, then the uninstall registry, then Program Files.</summary>
         public static Install Find()
@@ -56,7 +58,7 @@ namespace ResponsaMcp
                 ins.Exe = Path.GetFullPath(c);
                 ins.Dir = Path.GetDirectoryName(ins.Exe);
                 ins.DataDir = ReadDataLocation(ins.Dir);
-                try { ins.Version = FileVersionInfo.GetVersionInfo(ins.Exe).FileVersion; } catch { ins.Version = "?"; }
+                try { var fv = FileVersionInfo.GetVersionInfo(ins.Exe); ins.Version = fv.FileVersion; ins.Major = fv.FileMajorPart; } catch { ins.Version = "?"; }
                 return ins;
             }
             throw new ToolError("Responsa (Bar-Ilan Responsa Project) was not found on this PC. Set RESPONSA_MCP_EXE to the full path of RESPONSA.exe.");
@@ -82,13 +84,62 @@ namespace ResponsaMcp
     }
 
     /// <summary>
+    /// IT-785: which workspace autosave file Responsa uses. On Responsa 29 it is DATA\responsaext1.029, and every data
+    /// file ends in .029, so the suffix is taken to be the version. The file is found by name instead of being fixed:
+    /// DATA\responsaext1.0NN (three digits, the first 0; nothing longer, so a name like responsaext1.029_ never matches).
+    /// </summary>
+    internal sealed class WorkspaceFile
+    {
+        public const int TestedMajor = 29;
+        static readonly Regex Name = new Regex(@"^responsaext1\.0[0-9]{2}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        public string Path;            // the file to protect; null when several match
+        public List<string> Matches;   // every matching file in DATA\
+        public string State;           // "found", "none" or "several"
+
+        /// <summary>
+        /// Exactly one match: that file. None: the name Responsa of this version is expected to create
+        /// (responsaext1.0NN for major version NN; .029 when the version is unknown), protected as a file that did not
+        /// exist before. Several: no path; the caller refuses to start.
+        /// </summary>
+        public static WorkspaceFile Find(string dataDir, int major)
+        {
+            var r = new WorkspaceFile { Matches = new List<string>() };
+            string data = System.IO.Path.Combine(dataDir, "DATA");
+            // Every file is listed and matched here, not with a Directory.GetFiles pattern: Windows also matches
+            // patterns against 8.3 short names, so "responsaext1.0??" could match a longer name.
+            if (Directory.Exists(data))
+                foreach (var f in Directory.GetFiles(data))
+                    if (Name.IsMatch(System.IO.Path.GetFileName(f))) r.Matches.Add(f);
+            r.Matches.Sort(StringComparer.OrdinalIgnoreCase);
+            if (r.Matches.Count == 1) { r.State = "found"; r.Path = r.Matches[0]; }
+            else if (r.Matches.Count == 0) { r.State = "none"; r.Path = System.IO.Path.Combine(data, ExpectedName(major)); }
+            else r.State = "several";
+            return r;
+        }
+
+        public static string ExpectedName(int major)
+        {
+            return "responsaext1." + (major > 0 && major < 100 ? major : TestedMajor).ToString("000");
+        }
+
+        /// <summary>The error when several files match: the tool does not guess which one Responsa uses.</summary>
+        public string SeveralError()
+        {
+            return "Responsa's data folder has several workspace files (" + string.Join(", ", Matches.Select(m => System.IO.Path.GetFileName(m)).ToArray())
+                + " in " + System.IO.Path.GetDirectoryName(Matches[0]) + "). responsa-mcp does not know which one this Responsa uses, so it does not start its instance. "
+                + "The suffix is probably the Responsa version (.029 for Responsa 29). The user can move the file of a version that is no longer installed out of the DATA folder, with every Responsa closed.";
+        }
+    }
+
+    /// <summary>
     /// The tool's own Responsa process. It is held by its process handle from CreateProcess (never by PID alone),
     /// recorded on disk until it has exited, watched by a WorkspaceGuard while alive, and ended without
     /// Responsa's exit save.
     /// </summary>
     internal sealed class Instance
     {
-        public const string WorkspaceFile = @"DATA\responsaext1.029";
+        public WorkspaceFile Workspace;  // IT-785: resolved when the current instance starts, kept for its lifetime
         readonly UiThread ui;
         readonly string stateDir, instancesDir, guardDir;
         readonly long serverStart = Proc.Self();
@@ -208,11 +259,15 @@ namespace ResponsaMcp
             if (Install == null) Install = Install.Find();
             if (!Directory.Exists(Install.DataDir)) throw new ToolError("Responsa data folder not found: " + Install.DataDir);
 
+            // IT-785: the workspace file is found once per instance start, before anything is copied or launched.
+            var ws = WorkspaceFile.Find(Install.DataDir, Install.Major);
+            Workspace = ws;
+            if (ws.Path == null) throw new ToolError(ws.SeveralError());
+
             sequence++;
             string id = serverPid + "-" + serverStart + "-" + sequence;
             world = new GuardWorld(this);
-            guard = new WorkspaceGuard(Path.Combine(Install.DataDir, WorkspaceFile), guardDir, id, world);
-            try { guard.Begin(); }
+            try { guard = StartGuard(ws.Path, guardDir, id, world, null, 30, 100); }
             catch { world.Dispose(); world = null; guard = null; throw; }
             StartupLog.Clear();
             int pid;
@@ -223,6 +278,34 @@ namespace ResponsaMcp
             watch = new Timer(delegate { try { guard.Tick(); } catch { } }, null, 1500, 1500);
             string err = ui.Run(delegate () { return WaitReady(); }, 90000);
             if (err != null) { Stop(); throw new ToolError(err); }
+        }
+
+        /// <summary>
+        /// IT-785 (review round 1): checks that every other live server's guard protects the same workspace file, and
+        /// only then creates this guard and calls Begin. Their kept copies are compared and shared, so a guard of another
+        /// file must never be adopted. A meta that cannot be read (being rewritten) is read again, up to `attempts`
+        /// times `sleepMs` apart, as Begin does; still unreadable, it is not taken as "the same file": nothing starts.
+        /// `fileOf` is WorkspaceGuard.FileOf unless a test passes another reader.
+        /// </summary>
+        internal static WorkspaceGuard StartGuard(string path, string guardDir, string id, IGuardWorld world, Func<string, string> fileOf, int attempts, int sleepMs)
+        {
+            if (fileOf == null) fileOf = other => WorkspaceGuard.FileOf(guardDir, other);
+            foreach (var other in world.OtherGuardIds())
+            {
+                string f = null;
+                for (int i = 0; i < attempts && f == null; i++)
+                {
+                    if (i > 0) Thread.Sleep(sleepMs);
+                    f = fileOf(other);
+                }
+                if (f == null)
+                    throw new ToolError("could not read which workspace file another responsa-mcp server protects; not starting a second instance. Try again in a moment.");
+                if (!string.Equals(Path.GetFullPath(f), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase))
+                    throw new ToolError("another responsa-mcp server protects the workspace file " + f + ", but this one found " + path + "; not starting a second instance. Try again after the other server has stopped.");
+            }
+            var g = new WorkspaceGuard(path, guardDir, id, world);
+            g.Begin();
+            return g;
         }
 
         /// <summary>Waits for the main window, answers the known start-up dialogs, closes windows restored from the workspace.</summary>
