@@ -28,7 +28,7 @@ const net = require("node:net");
 const path = require("node:path");
 
 const SERVER_NAME = "otzar-hachochma";
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.1.1";
 const CDP_HOST = "127.0.0.1";
 // Versions this package was tested with. A difference is a warning, not an error.
 const TESTED_WITH = { electron: "18.2.0", otzarVer: 19, updatesVer: 7.40001 };
@@ -75,7 +75,8 @@ function int(v, name, min = 0, max = 999999999999) {
   if (!Number.isInteger(n) || n < min || n > max) throw new UserError(`${name} must be an integer between ${min} and ${max}`);
   return n;
 }
-class UserError extends Error {}
+// code (optional): a stable name for messages that the shortcut turns into a Hebrew popup (IT-788).
+class UserError extends Error { constructor(message, code) { super(message); if (code) this.code = code; } }
 
 // ---------------------------------------------------------------------------------------------
 // Windows discovery: install folder, running process, CDP port
@@ -153,19 +154,22 @@ function findInstall() {
 function otzarProcesses() {
   let out;
   try {
-    out = ps(`@(Get-CimInstance Win32_Process -Filter "Name='otzar.exe'" | Select-Object ProcessId,ExecutablePath,CommandLine) | ConvertTo-Json -Compress`);
+    // Created: start time in ms since 1970 (UTC), or null when Windows does not say. IT-788: an
+    // Otzar that never answers is told apart from one that is still loading by its age.
+    out = ps(`@(Get-CimInstance Win32_Process -Filter "Name='otzar.exe'" | Select-Object ProcessId,ExecutablePath,CommandLine,@{n='Created';e={ if ($_.CreationDate) { [long]([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { $null } }}) | ConvertTo-Json -Compress`);
   } catch (e) {
     // Fallback without command lines: enough to know whether Otzar is running at all.
     const r = spawnSync(path.join(SYS32, "tasklist.exe"), ["/FI", "IMAGENAME eq otzar.exe", "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 15_000 });
     if (r.error || r.status !== 0) {
       throw new UserError(`Cannot tell whether Otzar HaChochma is running (the process list is unavailable), so it is not started. ${e.message}`);
     }
-    return String(r.stdout || "").split(/\r?\n/).filter((l) => /^"otzar\.exe"/i.test(l)).map((l) => ({ pid: Number(l.split('","')[1]), exe: null, cmd: "" }));
+    return String(r.stdout || "").split(/\r?\n/).filter((l) => /^"otzar\.exe"/i.test(l)).map((l) => ({ pid: Number(l.split('","')[1]), exe: null, cmd: "", created: null }));
   }
   if (!out) return [];
   let j;
   try { j = JSON.parse(out); } catch { throw new UserError("Cannot read the process list, so Otzar HaChochma is not started."); }
-  return (Array.isArray(j) ? j : [j]).map((p) => ({ pid: p.ProcessId, exe: p.ExecutablePath, cmd: p.CommandLine || "" }));
+  return (Array.isArray(j) ? j : [j]).map((p) => ({ pid: p.ProcessId, exe: p.ExecutablePath, cmd: p.CommandLine || "",
+    created: Number.isFinite(p.Created) ? p.Created : null }));
 }
 
 function freePort() {
@@ -185,6 +189,91 @@ async function cdpVersion(port) {
     if (!/\botzar\//i.test(v["User-Agent"] || "")) return null;
     return v;
   } catch { return null; }
+}
+
+// --- the Otzar data disk (IT-788) ---
+// Otzar's own starter (STARTER_API.getOtzarDrives in app.asar, update 7.40001) looks for its data
+// disk on every drive: a drive holds it if <drive>\data\otzar_ver.txt or
+// <drive>\otzarDisk\data\otzar_ver.txt exists. In network mode (onet.otzar or onet.otzar.tmp in
+// the otzarLocal install folder) no disk is needed. Without the disk the starter shows its own
+// box ("no Otzar disk connected") and the debugging port never answers, so the tool used to wait
+// on it as "still loading" forever. This check uses the same rule, read-only: it only tests
+// whether these files exist.
+// Returns (a promise of) { state: "present" | "missing" | "network" | "unknown" | "skipped", drives?,
+// skipped_drives?, reason? }. Only "missing" blocks a start.
+// Like the starter's checkDriveWithDeadLine, every drive has its own time limit (IT-788 review r1):
+// a drive that does not answer in DISK_PROBE_MS is skipped, and the others are still checked.
+// The first marker found gives "present" at once, even while another drive still hangs. Every
+// drive answered or skipped and no marker: "missing". "unknown" (never blocks) is kept for a check
+// that could not run: no otzarLocal folder, no drive list, or a probe that could not be started.
+const DISK_PROBE_MS = 5_000;
+const DISK_MARKERS = ["data\\otzar_ver.txt", "otzarDisk\\data\\otzar_ver.txt"];
+function otzarLocalDir(exe) {
+  let d = exe ? path.dirname(exe) : "";
+  for (let i = 0; i < 8 && d && path.dirname(d) !== d; i++) {
+    if (/^otzarLocal$/i.test(path.basename(d))) return d;
+    d = path.dirname(d);
+  }
+  return null;
+}
+// The drive letters ("C:", ...). GetDrives() only lists them; it does not touch any drive, so one
+// dead drive cannot stall it. Throws when the list cannot be read.
+function driveLetters() {
+  return ps(`[IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 2) }`, null, 15_000)
+    .split(/\r?\n/).map((d) => d.trim().toUpperCase()).filter((d) => /^[A-Z]:$/.test(d));
+}
+// Does one drive hold a marker? Its own cmd.exe child, so a drive that hangs blocks only that
+// child: after `ms` the answer is "timeout" and the child is left to Windows (killed, best effort).
+// Resolves "yes" | "no" | "timeout" | "error". The letter is checked here; the markers are constants.
+function probeDrive(letter, ms) {
+  if (!/^[A-Z]:$/.test(letter)) return Promise.resolve("error");
+  const test = DISK_MARKERS.map((x) => `if exist "${letter}\\${x}" (echo YES)`).join(" else ") + " else (echo NO)";
+  return new Promise((ok) => {
+    let done = false, out = "";
+    const finish = (r) => { if (!done) { done = true; clearTimeout(t); ok(r); } };
+    let child;
+    try {
+      child = spawn(path.join(SYS32, "cmd.exe"), ["/d", "/s", "/c", `"${test}"`], { windowsHide: true, windowsVerbatimArguments: true, stdio: ["ignore", "pipe", "ignore"] });
+    } catch { return ok("error"); }
+    const t = setTimeout(() => { try { child.kill(); } catch {} finish("timeout"); }, ms);
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => finish("error"));
+    child.on("close", (code) => finish(/\bYES\b/.test(out) ? "yes" : /\bNO\b/.test(out) && code === 0 ? "no" : "error"));
+  });
+}
+// The scan policy (pure, tested offline with a fake probe). All drives are probed at once, each
+// with its own limit; the first "yes" wins without waiting for the rest.
+function scanDrives(drives, probe, ms = DISK_PROBE_MS) {
+  return new Promise((ok) => {
+    if (!drives.length) return ok({ state: "unknown", reason: "no drives were listed" });
+    let left = drives.length, settled = false;
+    const skipped = [], failed = [];
+    const one = (d) => Promise.race([
+      Promise.resolve().then(() => probe(d, ms)).catch(() => "error"),
+      new Promise((r) => setTimeout(() => r("timeout"), ms + 500).unref()),
+    ]);
+    for (const d of drives) {
+      one(d).then((r) => {
+        if (settled) return;
+        if (r === "yes") { settled = true; return ok({ state: "present", drives: [d] }); }
+        if (r === "timeout") skipped.push(d);
+        else if (r !== "no") failed.push(d);
+        if (--left) return;
+        settled = true;
+        if (failed.length) ok({ state: "unknown", reason: `the check could not run on ${failed.join(", ")}`, skipped_drives: skipped });
+        else ok({ state: "missing", ...(skipped.length ? { skipped_drives: skipped } : {}) });
+      });
+    }
+  });
+}
+async function otzarDiskState(inst) {
+  if (process.env.OTZAR_MCP_SKIP_DISK_CHECK === "1") return { state: "skipped", reason: "OTZAR_MCP_SKIP_DISK_CHECK=1" };
+  const local = otzarLocalDir(inst && inst.exe);
+  if (!local) return { state: "unknown", reason: "the otzarLocal install folder was not found, so network mode cannot be checked" };
+  if (["onet.otzar", "onet.otzar.tmp"].some((f) => fs.existsSync(path.join(local, f)))) return { state: "network" };
+  let drives;
+  try { drives = driveLetters(); } catch (e) { return { state: "unknown", reason: `the drive list could not be read (${e.message.slice(0, 120)})` }; }
+  return scanDrives(drives, probeDrive, DISK_PROBE_MS);
 }
 
 // --- desktop shortcut and popup helpers (Windows Script Host through PowerShell) ---
@@ -234,6 +323,7 @@ const deps = {
   desktopDir: () => desktopDir(), readShortcut: (p) => readShortcut(p), writeShortcut: (s) => writeShortcut(s),
   popup: (t) => popup(t), activate: (pids) => activate(pids),
   startLockName: () => startLockName(),
+  diskState: (inst) => otzarDiskState(inst),
 };
 
 // --- start lock (IT-779 review N2) ---
@@ -301,6 +391,26 @@ const MSG_STILL_LOADING =
   "Otzar HaChochma is starting (it was opened from the shortcut or by another agent), but its agent connection does not answer yet. " +
   "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.";
 
+// IT-788: no data disk -> no start.
+const MSG_NO_DISK =
+  "The Otzar HaChochma data disk is not connected to this PC (no drive has data\\otzar_ver.txt), so Otzar was not started. " +
+  "Tell the user: connect the Otzar disk and try again. Do not retry until the user has done this.";
+// IT-788: an Otzar with a debugging port that still does not answer this long after it started is
+// not loading any more. The usual cause is a missing data disk (the starter waits on its own box,
+// or the disk's protection layer hangs the process so that it cannot even be ended).
+const STUCK_AFTER_MS = LAUNCH_WAIT_MS + 60_000;
+async function notAnsweringError(exe, ageMs) {
+  const disk = await deps.diskState(exe ? { exe } : null);
+  const mins = Math.max(1, Math.round(ageMs / 60_000));
+  return new UserError(
+    `Otzar HaChochma was started about ${mins} minute(s) ago, but it does not answer on its agent connection: it is not loading any more, it is stuck. ` +
+    (disk.state === "missing" ? "The Otzar data disk is not connected to this PC, which is the likely cause. " : "") +
+    "Tell the user: check that the Otzar disk is connected; if Otzar shows a message or an error, close it. " +
+    `If Otzar cannot be closed (it stays in Task Manager), restart the PC. Then open Otzar ${SHORTCUT_HINT}. ` +
+    "Nothing was closed or changed. Do not retry until the user has done this.",
+    disk.state === "missing" ? "not_answering_no_disk" : "not_answering");
+}
+
 // Makes sure Otzar runs with a CDP port and returns the port. Starts Otzar if it isn't running
 // (unless OTZAR_MCP_NO_LAUNCH=1). Never kills or restarts it.
 // waitForWindow=false returns as soon as the debugging port answers (used by the shortcut).
@@ -323,16 +433,24 @@ async function connectOrStart({ waitForWindow, loadingWaitMs }) {
     const ports = cmdPorts(procs);
     for (const port of ports) if (await cdpVersion(port)) return connected(port);
     if (ports.length) {
+      // IT-788: how long ago the newest Otzar with a debugging port was started (null: unknown).
+      // Past STUCK_AFTER_MS it is no longer "still loading": it does not answer at all.
+      const created = procs.filter((p) => cmdPorts([p]).length && Number.isFinite(p.created)).map((p) => p.created);
+      const ageAt0 = created.length ? Math.max(0, deps.now() - Math.max(...created)) : null;
+      const exe = (procs.find((p) => p.exe) || {}).exe || null;
+      if (ageAt0 != null && ageAt0 >= STUCK_AFTER_MS) throw await notAnsweringError(exe, ageAt0);
       const ours = state.lastStartPort != null && ports.includes(state.lastStartPort);
       if (ours && state.noAnswer) {
         throw new UserError(
           "Otzar HaChochma, started by this tool, is running but its agent connection does not answer (it is still loading, or it shows an error). " +
-          "Wait half a minute and call the tool again. If it still fails, tell the user: check Otzar on the screen and close it if it shows an error.");
+          "Wait half a minute and call the tool again. If it still fails, tell the user: check that the Otzar disk is connected, and check Otzar on the screen and close it if it shows an error.");
       }
       // Opened with a debugging port by someone else (the shortcut, another agent): it is still
-      // loading. Wait for it a little instead of telling the user to close it.
+      // loading. Wait for it a little instead of telling the user to close it, but never past the
+      // point where it counts as not answering.
+      const wait = ageAt0 == null ? loadingWaitMs : Math.min(loadingWaitMs, Math.max(1000, STUCK_AFTER_MS - ageAt0));
       const t0 = Date.now();
-      while (Date.now() - t0 < loadingWaitMs) {
+      while (Date.now() - t0 < wait) {
         await sleep(1000);
         for (const port of ports) {
           if (await cdpVersion(port)) {
@@ -342,6 +460,7 @@ async function connectOrStart({ waitForWindow, loadingWaitMs }) {
           }
         }
       }
+      if (ageAt0 != null && ageAt0 + (Date.now() - t0) >= STUCK_AFTER_MS) throw await notAnsweringError(exe, ageAt0 + (Date.now() - t0));
       throw new UserError(MSG_STILL_LOADING);
     }
     throw new UserError(MSG_ALREADY_OPEN);
@@ -364,6 +483,11 @@ async function connectOrStart({ waitForWindow, loadingWaitMs }) {
   }
   const inst = (state.install = state.install || deps.findInstall());
   if (!inst) throw new UserError("Otzar HaChochma installation not found (no OTZARAPPCD variable, no shortcut to otzar.exe, no standard folder).");
+  // IT-788: without its data disk Otzar never comes up (and may not be closable). Do not start it.
+  // Not a start, so it does not count for the cap and does not set noAnswer.
+  const disk = await deps.diskState(inst);
+  if (disk.state === "missing") throw new UserError(MSG_NO_DISK, "no_disk");
+  if (disk.state === "unknown") log("disk check skipped:", disk.reason);
   // Otzar started from a stripped environment fails in its main process (IT-742 incident:
   // "Failed to load image ... app.ico"). Only start it with a normal user environment.
   const missing = ["SystemRoot", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP"].filter((k) => !process.env[k]);
@@ -391,7 +515,7 @@ async function connectOrStart({ waitForWindow, loadingWaitMs }) {
   }
   throw new UserError(
     `Otzar HaChochma was started, but its agent connection (port ${port}) did not answer within ${LAUNCH_WAIT_MS / 1000}s. ` +
-    "If Otzar is still loading, call the tool again in a minute. Otherwise tell the user: check Otzar on the screen and close it if it shows an error. " +
+    "If Otzar is still loading, call the tool again in a minute. Otherwise tell the user: check that the Otzar disk is connected, and check Otzar on the screen and close it if it shows an error. " +
     "The tool will not start Otzar again by itself until it has connected once.");
 }
 
@@ -414,7 +538,19 @@ async function mainPage(port) {
 async function session() {
   const port = await ensureOtzar();
   const page = await mainPage(port);
-  if (!page) throw new UserError("Otzar's main window is not available yet (still loading?). Try again in a few seconds.");
+  if (!page) {
+    // IT-788: Otzar's starter may be up (the port answers) but waiting on its own "no Otzar disk"
+    // box, so the main window never comes. Say so instead of "still loading" every time.
+    let exe = state.install ? state.install.exe : null;
+    try { if (!exe) exe = (deps.otzarProcesses().find((p) => p.exe) || {}).exe || null; } catch {}
+    if ((await deps.diskState(exe ? { exe } : null)).state === "missing") {
+      throw new UserError(
+        "Otzar HaChochma is open, but its data disk is not connected, so its main window cannot load. " +
+        `Tell the user: connect the Otzar disk; if Otzar shows that no disk was found, press "נסה שוב" (try again) there, or close Otzar and open it again ${SHORTCUT_HINT}. ` +
+        "Do not retry until the user has done this.", "open_no_disk");
+    }
+    throw new UserError("Otzar's main window is not available yet (still loading?). Try again in a few seconds.");
+  }
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   // Bounded, so a half-closed Otzar can never hang the call (and every call queued after it).
   await new Promise((ok, fail) => {
@@ -480,6 +616,13 @@ const PAGE_HELPERS = `
     const e = req.c[k].exports;
     return (...a) => e[name](...a);
   };
+  // The exports of the first module that exports all these names as functions (IT-788: the
+  // compression library Otzar's own reader uses, found as inflate + inflateRaw + ungzip).
+  const __exportsWith = (names) => {
+    const req = __webpackReq(); if (!req) return null;
+    const k = Object.keys(req.c).find((k) => { const e = req.c[k] && req.c[k].exports; return e && names.every((n) => typeof e[n] === 'function'); });
+    return k ? req.c[k].exports : null;
+  };
 `;
 
 function apiGet(s, p) {
@@ -487,37 +630,125 @@ function apiGet(s, p) {
   return s.evaluate(`(async () => { const r = await globalThis.AXIOS_OFFLINE.get(${JSON.stringify(route)}); return r.data; })()`);
 }
 
-// IT-781: the reader's index of a book: GET api/books/data/<id>, a zlib-deflated JSON array
-// [bookInfo, pages, tsiyunim, mareiMekomot]. It is inflated and parsed inside Otzar's page, and
+// IT-781: the reader's index of a book: GET api/books/data/<id>, a compressed JSON array
+// [bookInfo, pages, tsiyunim, mareiMekomot]. It is decoded and parsed inside Otzar's page, and
 // only a trimmed copy comes back over CDP: refs as [title, page, type], non-empty pages as
 // [position, label]. Matching is done here (pure functions below, tested offline).
+//
+// IT-788: decoded the way Otzar's own reader does it, so it works on every disk version. Otzar's
+// getAllData() (module "bf84", update 7.40001) GETs the same route through the same Axios object
+// (under Electron, c.Axios is globalThis.AXIOS_OFFLINE), then: try { r = inflate(r) } catch {};
+// r = new TextDecoder().decode(r); JSON.parse(r). Its inflate() is pako's, which detects zlib and
+// gzip by itself. getAllData() itself is not called: it also writes to the reader tab's store
+// (setTxtBook). The GET stays here, on the fixed route allow-list; only the decoder is Otzar's.
+// The decoder is found by export names (inflate + inflateRaw + ungzip), never by module id.
+// If it is missing, our own decoders follow: zlib, gzip, raw deflate, plain JSON. A body that none
+// of them reads gives a UserError with diagnostics (first bytes, length, what was tried, disk
+// version), never a raw SyntaxError.
+const BOOK_DATA_PAGE_FN = `async (route) => {
+  ${PAGE_HELPERS}
+  const diag = { tried: [] };
+  try { const lic = __root().$store.state.offline.licence; diag.otzar_disk_version = lic.otzarVer ?? null; } catch { diag.otzar_disk_version = null; }
+  let r;
+  try { r = await globalThis.AXIOS_OFFLINE.get(route, { responseType: 'arraybuffer' }); }
+  catch (e) { return { missing: true, diag: { ...diag, get_error: String(e && e.message || e).slice(0, 200) } }; }
+  let body = r ? r.data : null, parsed = null;
+  diag.data_type = body == null ? String(body) : ArrayBuffer.isView(body) ? body.constructor.name : body instanceof ArrayBuffer ? 'ArrayBuffer' : Array.isArray(body) ? 'array' : typeof body;
+  let u8 = null;
+  if (body instanceof ArrayBuffer) u8 = new Uint8Array(body);
+  else if (ArrayBuffer.isView(body)) u8 = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  else if (Array.isArray(body)) parsed = body; // already JSON (Axios parsed it)
+  else if (typeof body === 'string') {
+    // A string body: JSON text, or binary as one char per byte (what pako also accepts).
+    if (/^\\s*\\[/.test(body)) { try { parsed = JSON.parse(body); diag.decoder = 'string-json'; } catch {} }
+    if (!parsed) u8 = [...body].every((c) => c.charCodeAt(0) < 256) ? Uint8Array.from(body, (c) => c.charCodeAt(0)) : new TextEncoder().encode(body);
+  } else return { missing: true, diag };
+  if (u8) {
+    diag.length = u8.byteLength;
+    diag.head_hex = [...u8.subarray(0, 16)].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    if (!u8.byteLength) return { missing: true, diag };
+    if (u8.byteLength > 64 * 1024 * 1024) return { tooLarge: true, diag };
+    const parse = (bytes) => { let t = new TextDecoder().decode(bytes); if (t.charCodeAt(0) === 0xfeff) t = t.slice(1); const j = JSON.parse(t); if (!Array.isArray(j)) throw new Error('not an array'); return j; };
+    const stream = async (fmt) => new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream(fmt))).arrayBuffer());
+    const z = __exportsWith(['inflate', 'inflateRaw', 'ungzip']);
+    diag.otzar_decoder_found = !!z;
+    const attempts = [];
+    // 1. Exactly Otzar's own steps.
+    if (z) attempts.push(['otzar', async () => { let x = u8; try { x = z.inflate(x); } catch {} return parse(x); }]);
+    if (z) attempts.push(['otzar-inflateRaw', async () => parse(z.inflateRaw(u8))]);
+    // 2. Our own decoders (fallback when Otzar's decoder is not found or does not read it).
+    if (u8[0] === 0x1f && u8[1] === 0x8b) attempts.push(['gzip', async () => parse(await stream('gzip'))]);
+    if ((u8[0] & 0x0f) === 8 && ((u8[0] << 8) | u8[1]) % 31 === 0) attempts.push(['zlib', async () => parse(await stream('deflate'))]);
+    attempts.push(['plain', async () => parse(u8)]);
+    attempts.push(['deflate-raw', async () => parse(await stream('deflate-raw'))]);
+    for (const [name, fn] of attempts) {
+      try { parsed = await fn(); diag.decoder = name; break; }
+      catch (e) { diag.tried.push(name + ': ' + String(e && e.message || e).slice(0, 80)); }
+    }
+  }
+  if (!parsed) return { decodeFailed: true, diag };
+  const ts = Array.isArray(parsed[2]) ? parsed[2] : [], pg = Array.isArray(parsed[1]) ? parsed[1] : [];
+  const info = Array.isArray(parsed[0]) ? parsed[0][0] : null;
+  return {
+    refs: ts.filter((t) => t && typeof t.title === 'string').map((t) => [t.title, Number(t.page), Number(t.type)]),
+    pages: pg.filter((p) => p && !p.empty).map((p) => [Number(p.position), String((p.pagedata && p.pagedata[0] && p.pagedata[0].letter) || '')]),
+    isText: !!(info && info.moredata && info.moredata.isText == 1),
+    diag,
+  };
+}`;
+
 async function bookData(s, book) {
   const route = checkedPath(`api/books/data/${int(book, "book_id", 1)}`, [ROUTE_GET_DATA]);
-  const d = await s.evaluate(`(async () => {
-    let r;
-    try { r = await globalThis.AXIOS_OFFLINE.get(${JSON.stringify(route)}, { responseType: 'arraybuffer' }); } catch { return { missing: true }; }
-    let u8 = r.data;
-    if (u8 instanceof ArrayBuffer) u8 = new Uint8Array(u8);
-    else if (ArrayBuffer.isView(u8)) u8 = new Uint8Array(u8.buffer, u8.byteOffset, u8.byteLength);
-    else if (typeof u8 === 'string') u8 = new TextEncoder().encode(u8);
-    else return { missing: true };
-    if (!u8.byteLength) return { missing: true };
-    if (u8.byteLength > 64 * 1024 * 1024) return { tooLarge: true };
-    const text = u8[0] === 0x78
-      ? await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate'))).text()
-      : new TextDecoder().decode(u8);
-    const d = JSON.parse(text);
-    if (!Array.isArray(d)) return { missing: true };
-    const ts = Array.isArray(d[2]) ? d[2] : [], pg = Array.isArray(d[1]) ? d[1] : [];
-    return {
-      refs: ts.filter((t) => t && typeof t.title === 'string').map((t) => [t.title, Number(t.page), Number(t.type)]),
-      pages: pg.filter((p) => p && !p.empty).map((p) => [Number(p.position), String((p.pagedata && p.pagedata[0] && p.pagedata[0].letter) || '')]),
-    };
-  })()`, 90_000);
+  let d;
+  try { d = await s.evaluate(`(${BOOK_DATA_PAGE_FN})(${JSON.stringify(route)})`, 90_000); }
+  catch (e) {
+    // An exception inside the page is a format problem, reported with diagnostics. A lost CDP
+    // connection is not: errorText() turns that into "Otzar was closed".
+    if (/^CDP /.test(e.message)) throw e;
+    throw bookDataError(book, { tried: [`page: ${String(e.message).slice(0, 120)}`] });
+  }
   if (!d || d.missing) throw new UserError(`Book ${book} was not found in this library (license packages differ between users).`);
   if (d.tooLarge) throw new UserError(`The index of book ${book} is too large to read.`);
+  if (d.decodeFailed) throw bookDataError(book, d.diag);
+  // A text book (moredata.isText) has no page list in this route; Otzar's reader reads its pages
+  // from api/books/<id>/pages instead (already on the allow-list).
+  if ((!Array.isArray(d.pages) || !d.pages.length) && d.isText) {
+    d.pages = (await pagesOf(s, book)).map((p) => [Number(p.position), String(p.pagedata?.[0]?.letter || "")]);
+  }
   if (!Array.isArray(d.pages) || !d.pages.length) throw new UserError(`Book ${book} has no pages, or it is not in this library (license packages differ between users).`);
   return d;
+}
+
+// "otzar-mcp.exe doctor --book <id>" (IT-788): how this PC's Otzar returns a book's index, and
+// whether this tool reads it. Read-only: the same single GET as go_to_reference. Only sizes, the
+// first 16 bytes and counts are printed, never the book's content.
+async function indexCheck(book) {
+  const route = checkedPath(`api/books/data/${int(book, "book_id", 1)}`, [ROUTE_GET_DATA]);
+  return withSession(async (s) => {
+    const d = await s.evaluate(`(${BOOK_DATA_PAGE_FN})(${JSON.stringify(route)})`, 90_000);
+    const out = { book_id: book, ok: !!(d && d.refs), ...(d && d.diag) };
+    if (d && d.refs) Object.assign(out, { references: d.refs.length, pages: d.pages.length, text_book: d.isText });
+    else out.result = !d || d.missing ? "not found in this library" : d.tooLarge ? "too large" : "format not readable";
+    return out;
+  });
+}
+
+// The message for an index this tool cannot read (IT-788). It is meant to be sent to the developer
+// as is; "otzar-mcp.exe doctor --book <id>" prints the same details.
+function bookDataError(book, diag = {}) {
+  const parts = [
+    `disk version ${diag.otzar_disk_version ?? "unknown"}`,
+    `data type ${diag.data_type ?? "unknown"}`,
+    `length ${diag.length ?? "unknown"}`,
+    `first bytes [${diag.head_hex ?? ""}]`,
+    `Otzar's decoder ${diag.otzar_decoder_found ? "found" : "not found"}`,
+    `tried: ${(diag.tried || []).join("; ") || "nothing"}`,
+  ];
+  return new UserError(
+    `Could not read the index (tsiyunim) of book ${book}: this Otzar version returns it in a format this tool does not know. ` +
+    "go_to_reference and list_references cannot be used on this PC until the tool is updated; get_page_text with page_label still works. " +
+    `Tell the user to send this message to the otzar-mcp developer (or run: otzar-mcp.exe doctor --book ${book}). Details: ${parts.join(", ")}.`,
+    "book_data_format");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1479,6 +1710,14 @@ function shortcutPopupText(e) {
   if (m === MSG_STILL_LOADING || /is still running\. Wait a minute/.test(m)) return "אוצר החכמה עדיין נפתח.\nחכו שיסיים להיטען. אין צורך לפתוח אותו שוב.";
   if (/did not answer within/.test(m)) return "אוצר החכמה נפתח, אבל החיבור ל-AI עדיין לא עונה.\nאם אוצר החכמה עדיין נטען, חכו לו. אם מופיעה בו הודעת שגיאה, סגרו אותו ופתחו שוב מקיצור הדרך הזה.";
   if (/installation not found/.test(m)) return "לא נמצאה התקנה של אוצר החכמה במחשב הזה.";
+  // IT-788
+  const code = e instanceof UserError ? e.code : null;
+  if (code === "no_disk") return "הדיסק של אוצר החכמה לא מחובר למחשב, ולכן אוצר החכמה לא נפתח.\nחברו את הדיסק של אוצר החכמה ונסו שוב.";
+  if (code === "not_answering" || code === "not_answering_no_disk") {
+    return (code === "not_answering_no_disk" ? "הדיסק של אוצר החכמה לא מחובר למחשב.\n" : "") +
+      "אוצר החכמה נפתח, אבל הוא לא מגיב.\nבדקו שהדיסק של אוצר החכמה מחובר. אם מופיעה באוצר החכמה הודעה, סגרו אותו.\n" +
+      "אם אי אפשר לסגור את אוצר החכמה, הפעילו מחדש את המחשב, ואז פתחו אותו שוב מקיצור הדרך הזה.";
+  }
   return "לא הצלחנו לפתוח את אוצר החכמה עם החיבור ל-AI.\nנסו שוב בעוד דקה. אם זה חוזר, פתחו את אוצר החכמה מקיצור הדרך הרגיל.";
 }
 
@@ -1520,9 +1759,12 @@ async function cli() {
   }
   if (cmd === "launch" || cmd === "doctor") {
     try {
+      const bi = process.argv.indexOf("--book");
       const r = cmd === "launch"
         ? { cdp: `${CDP_HOST}:${await ensureOtzar()}`, started_by_this_tool: state.launchedByUs }
         : await toolStatus({ coverage_check: process.argv.includes("--coverage") });
+      if (cmd === "doctor") r.disk = await deps.diskState(state.install || { exe: r.install });
+      if (cmd === "doctor" && bi > 0) r.index_check = await indexCheck(int(process.argv[bi + 1], "--book", 1));
       if (state.warnings.size) r.warnings = [...state.warnings];
       process.stdout.write(JSON.stringify(r, null, 1) + "\n");
       process.exit(0);
@@ -1531,11 +1773,11 @@ async function cli() {
       process.exit(e instanceof UserError ? 2 : 1);
     }
   }
-  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage] | shortcut]\n");
+  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage] [--book <id>] | shortcut]\n");
   process.exit(64);
 }
 
 if (isSea || require.main === module) cli();
 module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, ROUTE_GET_DATA, findInstall,
   findReference, listReferences, refVariants, normTitle, groupOffsets, pageSegments, planHitWindow, hitText, cmdPorts,
-  shortcutPopupText, MSG_STILL_LOADING, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };
+  shortcutPopupText, MSG_STILL_LOADING, MSG_NO_DISK, STUCK_AFTER_MS, notAnsweringError, otzarDiskState, otzarLocalDir, DISK_MARKERS, DISK_PROBE_MS, scanDrives, probeDrive, BOOK_DATA_PAGE_FN, bookDataError, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };

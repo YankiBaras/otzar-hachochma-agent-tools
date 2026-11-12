@@ -29,8 +29,13 @@ function fakeCdp(ua, port = 0) {
     srv.listen(port, "127.0.0.1", () => ok(srv));
   });
 }
+// IT-788: the data-disk check is replaced too (default: the disk is connected), so no test reads
+// this PC's drives.
+const DISK_PRESENT = () => ({ state: "present", drives: ["T:"] });
+m.deps.diskState = DISK_PRESENT;
 const reset = () => {
   Object.assign(m.state, { port: null, install: null, launchedByUs: false, starts: [], noAnswer: false, lastStartPort: null });
+  m.deps.diskState = DISK_PRESENT;
 };
 
 test("route guard: allowed routes", () => {
@@ -755,4 +760,238 @@ test("IT-781 N1: the shortcut popup is not closed after 30 s; the loading messag
   const t = m.shortcutPopupText(new m.UserError(m.MSG_STILL_LOADING));
   assert.match(t, /עדיין נפתח/);
   assert.doesNotMatch(t, /[A-Za-z]{3,}/);
+});
+
+// =============================================================================================
+// IT-788: the book index on any disk version, and a start without the Otzar data disk
+// =============================================================================================
+const zlib = require("node:zlib");
+const fs = require("node:fs");
+
+// The page function of bookData(), run here in Node against a fake AXIOS_OFFLINE. Node has the
+// same TextDecoder / DecompressionStream / Blob / Response as Otzar's page. A fake webpack runtime
+// carries a pako-like module (inflate detects zlib and gzip, as pako does); it can be removed to
+// test our own fallback decoders.
+const PAKO = {
+  inflate: (x) => new Uint8Array(x[0] === 0x1f && x[1] === 0x8b ? zlib.gunzipSync(x) : zlib.inflateSync(x)),
+  inflateRaw: (x) => new Uint8Array(zlib.inflateRawSync(x)),
+  ungzip: (x) => new Uint8Array(zlib.gunzipSync(x)),
+};
+const fakeReq = { c: {} };
+globalThis.webpackJsonp = { push: ([[id], mods]) => mods[id]({}, {}, fakeReq) };
+async function runPage(data, { otzarDecoder = true, getFails = false } = {}) {
+  if (otzarDecoder) fakeReq.c.d7ac = { exports: PAKO }; else delete fakeReq.c.d7ac;
+  fakeReq.c.other = { exports: { inflate: () => { throw new Error("not this one"); } } }; // only inflate: never chosen
+  globalThis.AXIOS_OFFLINE = { get: async (route, opts) => {
+    assert.equal(route, "api/books/data/25882");
+    assert.equal(opts.responseType, "arraybuffer");
+    if (getFails) throw new Error("404");
+    return { data };
+  } };
+  try { return await (0, eval)(`(${m.BOOK_DATA_PAGE_FN})`)("api/books/data/25882"); } finally { delete globalThis.AXIOS_OFFLINE; }
+}
+const DATA = [[{ id: 25882, moredata: {} }],
+  [{ position: 1, pagedata: [{ letter: "א" }] }, { position: 2, empty: true }, { position: 3, pagedata: [{ letter: "ב" }] }],
+  [{ title: "סימן א", page: 1, type: 1 }, { title: "סימן ב", page: 3, type: 1 }], []];
+const JSON_BYTES = Buffer.from(JSON.stringify(DATA), "utf8");
+const ab = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+function assertData(r) {
+  assert.deepEqual(r.refs, [["סימן א", 1, 1], ["סימן ב", 3, 1]]);
+  assert.deepEqual(r.pages, [[1, "א"], [3, "ב"]]);
+}
+
+test("IT-788 book index: Otzar's own decoder (found by export names) reads zlib (v19), gzip, plain JSON and raw deflate", async () => {
+  for (const body of [zlib.deflateSync(JSON_BYTES), zlib.gzipSync(JSON_BYTES), JSON_BYTES]) {
+    const r = await runPage(ab(body));
+    assertData(r);
+    assert.equal(r.diag.decoder, "otzar");
+    assert.equal(r.diag.otzar_decoder_found, true);
+  }
+  const raw = await runPage(ab(zlib.deflateRawSync(JSON_BYTES)));
+  assertData(raw);
+  assert.equal(raw.diag.decoder, "otzar-inflateRaw");
+});
+
+test("IT-788 book index: without Otzar's decoder, our fallbacks read zlib (any window), gzip, raw deflate, plain JSON, a BOM", async () => {
+  const cases = [
+    [zlib.deflateSync(JSON_BYTES), "zlib"],
+    [zlib.deflateSync(JSON_BYTES, { windowBits: 13 }), "zlib"], // header 0x58, not 0x78
+    [zlib.gzipSync(JSON_BYTES), "gzip"],
+    [zlib.deflateRawSync(JSON_BYTES), "deflate-raw"],
+    [JSON_BYTES, "plain"],
+    [Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), JSON_BYTES]), "plain"],
+  ];
+  for (const [body, decoder] of cases) {
+    const r = await runPage(new Uint8Array(body), { otzarDecoder: false });
+    assertData(r);
+    assert.equal(r.diag.decoder, decoder, decoder);
+    assert.equal(r.diag.otzar_decoder_found, false);
+  }
+  assertData(await runPage(DATA, { otzarDecoder: false })); // already parsed by Axios
+  const s = await runPage(JSON.stringify(DATA), { otzarDecoder: false }); // JSON text as a string
+  assertData(s);
+  assert.equal(s.diag.decoder, "string-json");
+  assertData(await runPage(zlib.deflateSync(JSON_BYTES).toString("latin1"))); // binary string, one char per byte
+});
+
+test("IT-788 book index: an unknown format -> diagnostics (first bytes, length, tried), never a raw SyntaxError", async () => {
+  const junk = Buffer.from([0x4f, 0x54, 0x5a, 0x01, 0x02, 0x03, 0xff, 0xfe, 0x00, 0x10]);
+  const r = await runPage(ab(junk));
+  assert.equal(r.decodeFailed, true);
+  assert.equal(r.diag.length, 10);
+  assert.equal(r.diag.head_hex, "4f 54 5a 01 02 03 ff fe 00 10");
+  assert.ok(r.diag.tried.length >= 3);
+  const e = m.bookDataError(25882, { ...r.diag, otzar_disk_version: 21 });
+  assert.ok(e instanceof m.UserError);
+  assert.equal(e.code, "book_data_format");
+  assert.match(e.message, /^Could not read the index \(tsiyunim\) of book 25882/);
+  assert.match(e.message, /disk version 21/);
+  assert.match(e.message, /first bytes \[4f 54 5a 01/);
+  assert.match(e.message, /doctor --book 25882/);
+  assert.equal((await runPage(null, { getFails: true })).missing, true);
+  assert.equal((await runPage(new ArrayBuffer(0))).missing, true);
+});
+
+test("IT-788 book index: a text book (moredata.isText) is flagged, so its pages come from the page list", async () => {
+  const txt = [[{ id: 5, moredata: { isText: 1 } }]];
+  const r = await runPage(ab(zlib.deflateSync(Buffer.from(JSON.stringify(txt)))));
+  assert.equal(r.isText, true);
+  assert.deepEqual(r.refs, []);
+  assert.deepEqual(r.pages, []);
+});
+
+test("IT-788 disk: Otzar's own rule (data\\otzar_ver.txt); network mode needs no disk; unknown setups never block", async () => {
+  assert.deepEqual(m.DISK_MARKERS, ["data\\otzar_ver.txt", "otzarDisk\\data\\otzar_ver.txt"]);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "otzar-mcp-test-"));
+  try {
+    const local = path.join(root, "otzarApp", "otzarLocal");
+    const exe = path.join(local, "launcher", "bin", "x64", "app", "otzar.exe");
+    fs.mkdirSync(path.dirname(exe), { recursive: true });
+    assert.equal(m.otzarLocalDir(exe), local);
+    fs.writeFileSync(path.join(local, "onet.otzar"), "");
+    assert.equal((await m.otzarDiskState({ exe })).state, "network");
+    assert.equal((await m.otzarDiskState({ exe: "Z:\\somewhere\\otzar.exe" })).state, "unknown");
+    assert.equal((await m.otzarDiskState(null)).state, "unknown");
+    process.env.OTZAR_MCP_SKIP_DISK_CHECK = "1";
+    assert.equal((await m.otzarDiskState({ exe })).state, "skipped");
+  } finally { delete process.env.OTZAR_MCP_SKIP_DISK_CHECK; fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// IT-788 review r1: the real scan policy (scanDrives), with a fake probe per drive. "hang" never
+// answers (a dead drive); the policy's own limit must skip it.
+const fakeProbe = (answers, calls = []) => (d) => { calls.push(d); const a = answers[d]; return a === "hang" ? new Promise(() => {}) : Promise.resolve(a); };
+
+test("IT-788 disk scan: a drive that hangs is skipped; a marker on another drive is 'present' without waiting for it", async () => {
+  const calls = [];
+  const t0 = Date.now();
+  const r = await m.scanDrives(["C:", "Z:", "E:"], fakeProbe({ "C:": "no", "Z:": "hang", "E:": "yes" }, calls), 1500);
+  assert.deepEqual(r, { state: "present", drives: ["E:"] });
+  assert.ok(Date.now() - t0 < 1000, "did not wait for the hanging drive");
+  assert.deepEqual(calls, ["C:", "Z:", "E:"], "every drive is checked, also the ones after a hanging drive");
+  // The hanging drive comes first and the marker last: still present.
+  assert.equal((await m.scanDrives(["Z:", "Y:", "E:"], fakeProbe({ "Z:": "hang", "Y:": "hang", "E:": "yes" }), 1500)).state, "present");
+  // A probe that answers "timeout" by itself is skipped the same way.
+  assert.equal((await m.scanDrives(["Z:", "E:"], fakeProbe({ "Z:": "timeout", "E:": "yes" }), 1500)).state, "present");
+});
+
+test("IT-788 disk scan: drives that hang plus no marker anywhere -> 'missing' (blocks), not 'unknown'", async () => {
+  const t0 = Date.now();
+  const r = await m.scanDrives(["C:", "Z:", "D:"], fakeProbe({ "C:": "no", "Z:": "hang", "D:": "no" }), 1500);
+  assert.equal(r.state, "missing");
+  assert.deepEqual(r.skipped_drives, ["Z:"]);
+  assert.ok(Date.now() - t0 < 1500 + 500 + 1000, "bounded by one drive's limit, not the sum");
+  assert.deepEqual(await m.scanDrives(["C:", "D:"], fakeProbe({ "C:": "no", "D:": "no" }), 1500), { state: "missing" });
+  // Only a check that could not run is 'unknown': a probe that fails, a probe that throws, no drives.
+  assert.equal((await m.scanDrives(["C:", "D:"], fakeProbe({ "C:": "no", "D:": "error" }), 1500)).state, "unknown");
+  assert.equal((await m.scanDrives(["C:"], () => { throw new Error("spawn failed"); }, 1500)).state, "unknown");
+  assert.equal((await m.scanDrives([], fakeProbe({}), 1500)).state, "unknown");
+  assert.equal(m.DISK_PROBE_MS, 5000);
+});
+
+test("IT-788 disk scan: the real per-drive probe reads the markers and refuses a bad drive name", async () => {
+  // A real cmd.exe child on the system drive (read-only "if exist"): this PC's system drive has no
+  // Otzar marker at its root, so "no" (or "yes" if it has); never an error or a hang.
+  const sys = (process.env.SystemDrive || "C:").toUpperCase();
+  assert.ok(["no", "yes"].includes(await m.probeDrive(sys, 10_000)));
+  assert.equal(await m.probeDrive("C:\" & echo YES & \"", 1000), "error");
+  assert.equal(await m.probeDrive("CC:", 1000), "error");
+});
+
+test("IT-788 disk: no Otzar disk -> Otzar is not started, clear message, no start counted; 'unknown' never blocks", async () => {
+  reset();
+  const mc = fakeMachine();
+  m.deps.diskState = () => ({ state: "missing" });
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false }),
+    (e) => e instanceof m.UserError && e.code === "no_disk" && e.message === m.MSG_NO_DISK && /connect the Otzar disk/.test(e.message));
+  assert.equal(mc.spawns, 0);
+  assert.deepEqual(m.state.starts, []);
+  assert.equal(m.state.noAnswer, false);
+  m.deps.diskState = () => ({ state: "unknown", reason: "test" });
+  try { await m.ensureOtzar({ waitForWindow: false }); assert.equal(mc.spawns, 1); } finally { await mc.close(); }
+});
+
+test("IT-788 disk: the shortcut without the disk -> a Hebrew-only popup, nothing started", async () => {
+  reset();
+  const sh = fakeShell();
+  const mc = fakeMachine();
+  m.deps.diskState = () => ({ state: "missing" });
+  assert.equal(await m.launchFromShortcut(), 2);
+  assert.equal(mc.spawns, 0);
+  assert.equal(sh.popups.length, 1);
+  assert.match(sh.popups[0], /^הדיסק של אוצר החכמה לא מחובר למחשב/);
+  assert.match(sh.popups[0], /חברו את הדיסק/);
+  assert.doesNotMatch(sh.popups[0], /[A-Za-z]{3,}/);
+});
+
+test("IT-788: an Otzar that started long ago and never answers is 'stuck', not 'still loading', at once", async () => {
+  reset();
+  const mc = fakeMachine();
+  const port = await freeLoopbackPort(); // nothing listens: never answers
+  mc.extra = { pid: 66, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${port}`, created: mc.now - m.STUCK_AFTER_MS - 1000 };
+  const t0 = Date.now();
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false, loadingWaitMs: 8000 }),
+    (e) => e.code === "not_answering" && /stuck/.test(e.message) && /restart the PC/.test(e.message) && !/disk is not connected/.test(e.message));
+  assert.ok(Date.now() - t0 < 1000, "no loading wait");
+  m.deps.diskState = () => ({ state: "missing" });
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false }), (e) => e.code === "not_answering_no_disk" && /data disk is not connected/.test(e.message));
+  assert.equal(mc.spawns, 0, "never started again");
+  // The same through the shortcut: Hebrew only, says to check the disk and to restart the PC.
+  const sh = fakeShell();
+  assert.equal(await m.launchFromShortcut(), 2);
+  assert.match(sh.popups[0], /^הדיסק של אוצר החכמה לא מחובר למחשב/);
+  assert.match(sh.popups[0], /לא מגיב/);
+  assert.match(sh.popups[0], /הפעילו מחדש את המחשב/);
+  assert.doesNotMatch(sh.popups[0], /[A-Za-z]{3,}/);
+  m.deps.diskState = DISK_PRESENT;
+  assert.doesNotMatch(m.shortcutPopupText(await m.notAnsweringError(INSTALL, m.STUCK_AFTER_MS)), /[A-Za-z]{3,}|לא מחובר למחשב/);
+});
+
+test("IT-788: the loading wait ends when the Otzar becomes 'stuck'; a young one is still 'still loading'", async () => {
+  reset();
+  const mc = fakeMachine();
+  const port = await freeLoopbackPort();
+  mc.extra = { pid: 67, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${port}`, created: mc.now - (m.STUCK_AFTER_MS - 1500) };
+  const t0 = Date.now();
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false, loadingWaitMs: 8000 }), (e) => e.code === "not_answering");
+  assert.ok(Date.now() - t0 < 4500, "waited only until it counted as stuck");
+  mc.extra.created = mc.now - 10_000; // started 10 s ago
+  await assert.rejects(m.ensureOtzar({ waitForWindow: false, loadingWaitMs: 1200 }), (e) => e.message === m.MSG_STILL_LOADING);
+  assert.equal(mc.spawns, 0);
+});
+
+test("IT-788: the starter answers but there is no main window and no disk -> 'connect the disk', not 'still loading'", async () => {
+  reset();
+  const starter = await fakeCdp(UA_OTZAR); // its /json/list is []: no main window
+  try {
+    m.state.port = starter.address().port;
+    m.state.checked = true;
+    m.deps.otzarProcesses = () => [{ pid: 3, exe: INSTALL, cmd: `"${INSTALL}" --remote-debugging-port=${m.state.port}` }];
+    m.deps.diskState = () => ({ state: "missing" });
+    const r = await m.callTool("book_info", { book_id: 25882 });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /data disk is not connected/);
+    m.deps.diskState = DISK_PRESENT;
+    const r2 = await m.callTool("book_info", { book_id: 25882 });
+    assert.match(r2.content[0].text, /still loading/);
+  } finally { m.state.port = null; await closeSrv(starter); }
 });
