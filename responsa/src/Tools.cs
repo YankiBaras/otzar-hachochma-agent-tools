@@ -18,6 +18,8 @@ namespace ResponsaMcp
         readonly List<SearchState> searches = new List<SearchState>();
         int nextSearchId = 1;
         bool restartNeeded;
+        bool scoped;                                              // IT-789: the instance's selection is a books scope
+        readonly BookIndexCache bookIndex = new BookIndexCache(); // IT-789: names of the database tree, read once
 
         sealed class SearchState { public int Id; public string Query; public int Total; public IntPtr Window; }
 
@@ -57,12 +59,13 @@ namespace ResponsaMcp
         {
             if (restartNeeded) Restart();
             if (restartNeeded) throw new ToolError("the previous private Responsa has not exited yet; try again in a moment");
-            if (!inst.Alive) searches.Clear();
+            if (!inst.Alive) { searches.Clear(); scoped = false; }
             inst.EnsureRunning();
         }
         void Restart()
         {
             searches.Clear();
+            scoped = false;
             restartNeeded = !inst.Stop();
         }
         void CheckHealth()
@@ -139,14 +142,53 @@ namespace ResponsaMcp
         }
 
         // ------------------------------------------------------------------ search
-        public object Search(string query, int allDatabases, int limit, int timeoutSec)
+        /// <summary>IT-789: books and all_databases: true contradict each other.</summary>
+        public static void CheckScope(int allDatabases, IList<string> books)
         {
+            if (books == null) return;
+            if (allDatabases == 1) throw new ToolError("books and all_databases: true cannot be used together; leave all_databases out (or false) to search only the named books");
+            if (books.Count == 0) throw new ToolError("books: give at least one book name, or leave books out");
+            if (books.Count > BookMatch.MaxBooks) throw new ToolError("books: at most " + BookMatch.MaxBooks + " names per search");
+        }
+
+        /// <summary>
+        /// IT-789: after a search with books, the instance's database selection is those books (in its memory only; never
+        /// saved). Any later search without books would inherit it: measured, even "חיפוש בכל המאגרים" (all_databases:
+        /// true) stays limited ("החיפוש מוגבל לספרים"). So the instance is restarted first: a new instance reads the
+        /// selection saved in Responsa's data folder, i.e. the user's own, and all_databases works again.
+        /// </summary>
+        public static bool NeedsFreshScope(bool scoped, IList<string> books)
+        {
+            return books == null && scoped;
+        }
+
+        public object Search(string query, int allDatabases, List<string> books, int limit, int timeoutSec)
+        {
+            CheckScope(allDatabases, books);
+            string note = null;
+            if (NeedsFreshScope(scoped, books))
+            {
+                Restart();
+                note = "the previous search was limited to books, so the private Responsa instance was restarted to lift that limit; earlier search_ids are gone";
+            }
             return Op(delegate ()
             {
                 int pid = (int)inst.Pid;
+                BookSelection scope = null;
+                if (books != null)
+                {
+                    scope = ui.Run(delegate () { return Ui.SelectBooks((uint)pid, books, bookIndex, delegate { scoped = true; }); }, 240000);
+                    allDatabases = 0;
+                }
                 var outcome = ui.Run(delegate () { return Ui.Search((uint)pid, query, allDatabases, timeoutSec); }, (timeoutSec + 30) * 1000);
                 var r = new Dictionary<string, object>();
                 r["query"] = query;
+                if (scope != null)
+                {
+                    r["scope"] = scope.Nodes.Select(b => (object)b.Display).ToList();
+                    if (scope.Notes.Count > 0) r["books_note"] = scope.Notes;
+                }
+                if (note != null) r["note"] = note;
                 r["seconds"] = outcome.Seconds;
                 if (outcome.Messages.Count > 0) r["responsa_messages"] = outcome.Messages;
                 if (outcome.Breakdown.Count > 0)

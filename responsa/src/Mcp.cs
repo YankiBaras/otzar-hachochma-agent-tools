@@ -113,6 +113,30 @@ namespace ResponsaMcp
                     if (n < min || n > max) throw new ToolError(kv.Key + " must be between " + min + " and " + max);
                     clean[kv.Key] = (int)n;
                 }
+                else if (type == "array")
+                {
+                    // IT-789: an array of single-line strings (the only kind of array the tools take)
+                    var list = v as IList;
+                    if (list == null || v is string) throw new ToolError(kv.Key + " must be an array of strings");
+                    int minItems = p.ContainsKey("minItems") ? Convert.ToInt32(p["minItems"]) : 0;
+                    int maxItems = p.ContainsKey("maxItems") ? Convert.ToInt32(p["maxItems"]) : int.MaxValue;
+                    if (list.Count < minItems) throw new ToolError(kv.Key + " must have at least " + minItems + " item(s)");
+                    if (list.Count > maxItems) throw new ToolError(kv.Key + " must have at most " + maxItems + " items");
+                    var items = (Dictionary<string, object>)p["items"];
+                    int maxLen = items.ContainsKey("maxLength") ? Convert.ToInt32(items["maxLength"]) : int.MaxValue;
+                    var outList = new List<string>();
+                    foreach (var o in list)
+                    {
+                        var s = o as string;
+                        if (s == null) throw new ToolError(kv.Key + " must be an array of strings");
+                        s = s.Trim();
+                        if (s.Length == 0) throw new ToolError(kv.Key + " must not contain an empty string");
+                        if (s.Length > maxLen) throw new ToolError(kv.Key + ": an item is too long (max " + maxLen + " characters)");
+                        if (s.IndexOfAny(new[] { '\r', '\n', '\t', '\0' }) >= 0) throw new ToolError(kv.Key + ": items must be single lines");
+                        outList.Add(s);
+                    }
+                    clean[kv.Key] = outList;
+                }
                 else if (type == "boolean")
                 {
                     if (!(v is bool)) throw new ToolError(kv.Key + " must be true or false");

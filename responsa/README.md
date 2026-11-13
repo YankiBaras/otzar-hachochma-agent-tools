@@ -7,6 +7,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
 - `responsa-mcp.exe` starts **its own** `RESPONSA.exe` on a private Windows desktop that is never shown, so none of its windows ever appears on the user's screen. Responsa allows several instances, so the user's own Responsa keeps working normally.
 - It drives that instance only with Win32 messages to its own process:
   - search dialog, results window, "כתיבת מקורות"
+  - the search dialog's database chooser, when a search is limited to books (IT-789): a click posted to its own hidden tree window, not real mouse input
   - Responsa's own File → Save, which writes Unicode text to the tool's temp folder; the tool reads the file and deletes it
 - It never reads Responsa's content files (the books and their indexes) and never drives or ends the user's Responsa. It reads two small files:
   - `Responsa.env`, to find the data folder
@@ -16,7 +17,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
 
 ## Install on a PC
 
-1. Build once (on any Windows PC): `powershell -File responsa\build.ps1`. The result is `responsa\dist\responsa-mcp.exe`, about 60 KB.
+1. Build once (on any Windows PC): `powershell -File responsa\build.ps1`. The result is `responsa\dist\responsa-mcp.exe`, about 90 KB.
 2. Copy `responsa-mcp.exe` to a folder of your own, for example `%LOCALAPPDATA%\ResponsaMcp\bin\`.
 3. Register it:
    - **Claude Code:** `claude mcp add responsa -- "%LOCALAPPDATA%\ResponsaMcp\bin\responsa-mcp.exe"`
@@ -34,10 +35,24 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 | Tool | Does |
 |---|---|
 | `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), the workspace file it protects (`workspace_file`) and open searches. |
-| `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. |
+| `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. Optional `books`: search only named books (see below). |
 | `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. |
 | `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. |
 | `close_windows` | Closes the result and text windows of the private instance. |
+
+## Searching only some books (IT-789)
+
+`search` takes an optional `books`: up to 20 names from Responsa's database tree, e.g. `["דניאל"]` or `["רש\"י ומפרשיו / רש\"י / דניאל", "מצודת דוד"]`.
+
+- **Names.** Each item is matched against the tree's categories, sub-categories and books (the top three levels). Quotation marks and gershayim are ignored, and so is word order, because Responsa stores some names in visual order. A deeper node (for example Rashi on one book) is reached through a path, parts separated by `/`.
+  - No match, or two matches at the same level: an error with the candidates (as paths). Nothing is searched.
+  - One match higher in the tree than the others (e.g. `בראשית` the book and the `בראשית` parts of Hasidic books): that one is taken and `books_note` names the others.
+- **Selecting.** The tool opens its instance's database chooser and presses "התחל שוב" (clear). It then posts a click to each named node of its own hidden tree. Each node is verified: its icon turns green (image 0).
+  - It reads the result back from Responsa's own "רשימת המאגרים שנבחרו" view. The search runs only if that view shows exactly the named nodes; otherwise the instance is restarted and an error is returned. The search never runs wider than asked.
+  - The reply's `scope` is that read-back.
+- **Afterwards.** The selection lives only in the tool's instance's memory. Measured on Responsa 29: confirming it writes nothing to the data folder, and the instance is never closed normally, so it is never saved. The user's own selection on disk is untouched.
+  - A later search without `books` would still be limited, even with `all_databases: true` (Responsa: "החיפוש מוגבל לספרים"). So the tool restarts its instance first (about 5 s). The new instance reads the user's saved selection again. The reply has a `note`, and earlier `search_id`s are gone.
+- **Speed.** The first search with `books` reads the tree names once per server (measured 6–24 s, about 10,000 nodes); later ones add about 1–5 s. Narrowing to books does not make Responsa's search itself faster.
 
 ## What it leaves behind, and what it protects
 
@@ -85,7 +100,9 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 ## Development
 
 - `src/`: the server.
-  - `Program.cs`: entry point and tool definitions
+  - `Program.cs`: entry point (`serve`, `doctor`, `version`)
+  - `ToolDefs.cs`: tool definitions and input schemas
+  - `Books.cs`: the books scope (IT-789): name matching, the database tree reader
   - `Mcp.cs`: JSON-RPC and argument validation
   - `Tools.cs`: tools and caps
   - `Instance.cs`: install discovery, the workspace file (`WorkspaceFile`, IT-785), lifecycle, orphans
@@ -96,5 +113,5 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
   - `Native.cs`: Win32
   - `SaveParse.cs`: parsing the saved files
 - `build.ps1 -Test`: builds and runs the offline tests (`test/OfflineTests.cs`, synthetic samples in `test/samples`).
-- `test/live-mcp.ps1`: end-to-end test through MCP. It needs Responsa.
+- `test/live-mcp.ps1`: end-to-end test through MCP. It needs Responsa. Run it with PowerShell 7 (`pwsh`): the file is UTF-8 without a BOM.
 - Design notes and the measurements behind the IDs are in `docs/responsa-mcp-plan.md`. That file is local and not committed.

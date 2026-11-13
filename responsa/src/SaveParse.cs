@@ -17,9 +17,34 @@ namespace ResponsaMcp
     internal static class SaveParse
     {
         /// <summary>Reads a saved file: UTF-16 with BOM as Responsa writes it; falls back to UTF-8 / cp1255.</summary>
-        public static string ReadSaved(string path)
+        public static string ReadSaved(string path) { return ReadSaved(path, 10000); }
+
+        /// <summary>
+        /// IT-789 (found by the live test): Ui.SaveVia can return while Responsa still has the file open for writing
+        /// ("being used by another process"). The file is read only once it can be opened with no sharing, i.e. once
+        /// Responsa has closed it, so a half-written file is never parsed. Waits up to waitMs, then fails as before.
+        /// </summary>
+        public static string ReadSaved(string path, int waitMs)
         {
-            byte[] b = File.ReadAllBytes(path);
+            byte[] b = null;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (b == null)
+            {
+                try
+                {
+                    using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        b = new byte[f.Length];
+                        int n = 0;
+                        while (n < b.Length) { int r = f.Read(b, n, b.Length - n); if (r <= 0) break; n += r; }
+                    }
+                }
+                catch (IOException)
+                {
+                    if (!File.Exists(path) || sw.ElapsedMilliseconds >= waitMs) throw;
+                    System.Threading.Thread.Sleep(100);
+                }
+            }
             if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) return Encoding.Unicode.GetString(b, 2, b.Length - 2);
             if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) return Encoding.UTF8.GetString(b, 3, b.Length - 3);
             return Encoding.GetEncoding(1255).GetString(b);

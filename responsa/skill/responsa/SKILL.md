@@ -9,7 +9,7 @@ The tools drive the user's own licensed Responsa program in a private, invisible
 
 ## Workflow
 
-1. `search` with an advanced-syntax query. Pass `all_databases: true` unless the user asked for specific books.
+1. `search` with an advanced-syntax query. Pass `all_databases: true` unless the question is about specific books; then pass `books` instead (see "Searching only some books").
 2. Look at `total` and `by_database`.
    - Too many results (Responsa refuses more than 32,000): narrow the query.
    - Zero results: broaden the query (prefixes, spellings, abbreviations, synonyms).
@@ -57,6 +57,24 @@ Errors come back in `responsa_messages`, verbatim in Hebrew:
 - "שגיאה בהגדרת השאילתה: ..." means the syntax is wrong. Fix it and search again.
 - "נמצאו מעל 32000 תוצאות" means the query is too broad.
 - "לא נמצאה כל תוצאה!" means no results.
+
+## Searching only some books (`books`)
+
+Use `books` when the question names books ("does Daniel mention Edom?", "what does Rashi on Daniel say about…", "in Esther and its commentaries"). Don't read a book chapter by chapter to answer such a question; search it.
+
+```json
+{ "query": "#(אדום/עשו)", "books": ["דניאל"] }
+```
+
+- Each item is a name from Responsa's own database tree: a category (`תנ"ך`, `מפרשי תנ"ך`), a book (`דניאל`, `משנה ברורה`) or a commentator (`מצודת דוד`). Up to 20 items. Quotation marks and gershayim are optional (`רשי` = `רש"י`).
+- A name in several places gives an error that lists them as paths. Repeat the search with a path, parts separated by `/`. Any ancestors are enough to tell them apart, e.g. `רש"י ומפרשיו / רש"י`.
+- A commentary on one book is commentator, then book: `רש"י ומפרשיו / רש"י / דניאל`, `מפרשי תנ"ך / מצודת דוד`. A bare book name is never looked up under a commentator.
+- A name that is a book and also a part of other books (e.g. `בראשית`, `תנ"ך`) is taken at its highest place in the tree, and `books_note` names the other places.
+- A name that matches nothing gives an error with close names, if any. Nothing is searched after any name error.
+- The reply's `scope` lists exactly what was searched, read back from Responsa. Quote it when you say where you looked.
+- `books` cannot be combined with `all_databases: true`.
+- The first search with `books` can take up to half a minute longer (the tool reads Responsa's tree once). Give it `timeout_sec` as usual; the tree reading has its own time limit.
+- The next search **without** `books` restarts the private instance to lift the limit (about 5 s). Its reply has a `note`, and earlier `search_id`s are gone. Group the scoped searches together.
 
 ## References for `open_text`
 

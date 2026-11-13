@@ -29,6 +29,7 @@ namespace ResponsaMcp
             ParseTests(samples);
             WorkspaceGuardTests();
             WorkspaceFileTests();
+            BookTests();
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
             Check(Ui.FixBidi("תלמוד בבלי") == "תלמוד בבלי", "FixBidi plain");
             Check(McpServer.Serialize(new Dictionary<string, object> { { "t", "גמ' <a> & b" } }) == "{\"t\":\"גמ' <a> & b\"}", "Serialize keeps ' < > & plain");
@@ -415,6 +416,119 @@ namespace ResponsaMcp
             finally { try { Directory.Delete(root, true); } catch { } }
         }
 
+        // ---- IT-789: books scope (name matching, read-back comparison, arguments, schema)
+        sealed class FakeTree : IBookTree
+        {
+            readonly List<BookNode> all = new List<BookNode>();
+            public int ChildCalls;
+            public FakeTree(params string[] paths)
+            {
+                // paths of raw names separated by '>', parents listed before children
+                foreach (var p in paths)
+                {
+                    var names = p.Split('>');
+                    var parent = names.Length == 1 ? null : all.First(n => n.Names.SequenceEqual(names.Take(names.Length - 1)));
+                    int index = all.Count(n => n.Names.Length == names.Length && (parent == null || parent.IsAncestorOf(n)));
+                    var path = (parent == null ? new int[0] : parent.Path).Concat(new[] { index }).ToArray();
+                    all.Add(new BookNode { Path = path, Names = names });
+                }
+            }
+            public List<BookNode> Top() { return all.Where(n => n.Depth <= 2).ToList(); }
+            public List<BookNode> Children(BookNode n) { ChildCalls++; return all.Where(c => c.Depth == n.Depth + 1 && n.IsAncestorOf(c)).ToList(); }
+            public BookNode Get(string p) { return all.First(n => string.Join(">", n.Names) == p); }
+        }
+        static FakeTree SampleTree()
+        {
+            return new FakeTree(
+                "תנ\"ך", "תנ\"ך>בראשית", "תנ\"ך>דניאל", "תנ\"ך>אסתר",
+                "מפרשי תנ\"ך", "מפרשי תנ\"ך>רש\"י ומפרשיו", "מפרשי תנ\"ך>רש\"י ומפרשיו>רש\"י",
+                "מפרשי תנ\"ך>רש\"י ומפרשיו>רש\"י>בראשית", "מפרשי תנ\"ך>רש\"י ומפרשיו>רש\"י>דניאל",
+                "מפרשי תנ\"ך>מפרשי תנ\"ך", "מפרשי תנ\"ך>מפרשי תנ\"ך>מצודת דוד", "מפרשי תנ\"ך>מפרשי תנ\"ך>רבינו] בחיי]",
+                "מפרשים ופוסקים על הבבלי והירושלמי", "מפרשים ופוסקים על הבבלי והירושלמי>מפרשי הבבלי", "מפרשים ופוסקים על הבבלי והירושלמי>מפרשי הבבלי>רש\"י",
+                "ספרי חסידות", "ספרי חסידות>אור המאיר", "ספרי חסידות>אור המאיר>בראשית",
+                "(ספרי שאלות ותשובות (שו\"ת", "(ספרי שאלות ותשובות (שו\"ת>ראשונים", "(ספרי שאלות ותשובות (שו\"ת>ראשונים>רשב\"א");
+        }
+
+        static void BookTests()
+        {
+            Check(BookMatch.Key("רש\"י") == BookMatch.Key("רשי") && BookMatch.Key("רש''י") == BookMatch.Key("רשי"), "key: quotes and gershayim ignored");
+            Check(BookMatch.Key("(ספרי שאלות ותשובות (שו\"ת") == BookMatch.Key("ספרי שאלות ותשובות (שו\"ת)"), "key: visual order and brackets ignored");
+            Check(BookMatch.Key("מצודת  דוד ") == BookMatch.Key("מצודת דוד") && BookMatch.Key("דניאל") != BookMatch.Key("דניאל א"), "key: spaces; words count");
+            Check(BookMatch.Display("(ספרי שאלות ותשובות (שו\"ת") == "ספרי שאלות ותשובות (שו\"ת)", "display: parentheses");
+            Check(BookMatch.Display("רבינו] בחיי]") == "[רבינו] בחיי", "display: square brackets");
+            Check(BookMatch.Segments(" מפרשי תנ\"ך / רש\"י /דניאל ").SequenceEqual(new[] { "מפרשי תנ\"ך", "רש\"י", "דניאל" }), "segments split on /");
+
+            var t = SampleTree();
+            string note;
+            Check(BookMatch.Resolve(t, "דניאל", out note).Display == "תנ\"ך / דניאל" && note == null, "resolve: unique book");
+            Check(BookMatch.Resolve(t, "רשב\"א").Display == "ספרי שאלות ותשובות (שו\"ת) / ראשונים / רשב\"א", "resolve: third level, quotes");
+            Check(BookMatch.Resolve(t, "רשבא").Name == "רשב\"א", "resolve: without gershayim");
+            Check(BookMatch.Resolve(t, "תנ\"ך").Display == "תנ\"ך", "resolve: a category");
+            Check(BookMatch.Resolve(t, "[רבינו] בחיי").Name == "רבינו] בחיי]", "resolve: a visually stored name, typed in reading order");
+            Throws(() => BookMatch.Resolve(t, "רש\"י"), "matches 2 places", "resolve: same depth twice is ambiguous");
+            Throws(() => BookMatch.Resolve(t, "רש\"י"), "מפרשי תנ\"ך / רש\"י ומפרשיו / רש\"י", "resolve: ambiguity lists the paths");
+            Check(BookMatch.Resolve(t, "רש\"י ומפרשיו / רש\"י").Path.SequenceEqual(t.Get("מפרשי תנ\"ך>רש\"י ומפרשיו>רש\"י").Path), "resolve: a path tells them apart");
+            Check(BookMatch.Resolve(t, "מפרשי הבבלי/רשי").Path.SequenceEqual(t.Get("מפרשים ופוסקים על הבבלי והירושלמי>מפרשי הבבלי>רש\"י").Path), "resolve: any ancestor in the path");
+            var b = BookMatch.Resolve(t, "בראשית", out note);
+            Check(b.Display == "תנ\"ך / בראשית" && note != null && note.Contains("אור המאיר"), "resolve: the one highest match is taken, with a note");
+            Throws(() => BookMatch.Resolve(t, "חסידות / בראשית"), "no book named", "resolve: a part of an ancestor name is not a match");
+            Check(BookMatch.Resolve(t, "ספרי חסידות / בראשית").Path.SequenceEqual(t.Get("ספרי חסידות>אור המאיר>בראשית").Path), "resolve: path picks the deeper one");
+            t.ChildCalls = 0;
+            var deep = BookMatch.Resolve(t, "רש\"י ומפרשיו / רש\"י / דניאל");
+            Check(deep.Path.SequenceEqual(t.Get("מפרשי תנ\"ך>רש\"י ומפרשיו>רש\"י>דניאל").Path) && t.ChildCalls == 1, "resolve: fourth level read only under the named parent");
+            t.ChildCalls = 0;
+            Throws(() => BookMatch.Resolve(t, "ספר שאינו קיים"), "no book named", "resolve: unknown name");
+            Check(t.ChildCalls == 0, "resolve: one-part unknown name reads nothing deeper");
+            Throws(() => BookMatch.Resolve(t, "מצודת"), "מצודת דוד", "resolve: unknown name lists close names");
+            Throws(() => BookMatch.Resolve(t, "רש\"י ומפרשיו / רש\"י / ספר"), "no book named", "resolve: unknown fourth level");
+            Throws(() => BookMatch.Resolve(t, " / "), "empty book name", "resolve: empty");
+            Throws(() => BookMatch.Resolve(t, "\"\""), "no letters", "resolve: no letters");
+
+            var all = BookMatch.ResolveAll(t, new List<string> { "דניאל", "תנ\"ך / דניאל", "אסתר" });
+            Check(all.Count == 2, "resolve all: duplicates removed");
+            all = BookMatch.ResolveAll(t, new List<string> { "דניאל", "תנ\"ך" });
+            Check(all.Count == 1 && all[0].Display == "תנ\"ך", "resolve all: a book inside a chosen category is dropped");
+            Throws(() => BookMatch.ResolveAll(t, new List<string>()), "at least one", "resolve all: empty list");
+            Throws(() => BookMatch.ResolveAll(t, Enumerable.Repeat("דניאל", 21).ToList()), "at most 20", "resolve all: cap");
+            List<string> notes;
+            BookMatch.ResolveAll(t, new List<string> { "בראשית", "דניאל" }, out notes);
+            Check(notes.Count == 1, "resolve all: notes collected");
+
+            var dan = t.Get("תנ\"ך>דניאל"); var est = t.Get("תנ\"ך>אסתר"); var tanach = t.Get("תנ\"ך");
+            var other = new BookNode { Path = new[] { -1 }, Names = new[] { "משהו" } };
+            Check(BookMatch.Compare(new List<BookNode> { dan, est }, new List<BookNode> { est, dan }) == null, "compare: same set");
+            Check(BookMatch.Compare(new List<BookNode> { dan }, new List<BookNode>()).Contains("not selected"), "compare: missing");
+            Check(BookMatch.Compare(new List<BookNode> { dan }, new List<BookNode> { dan, other }).Contains("משהו"), "compare: extra");
+            Check(BookMatch.Compare(new List<BookNode> { dan }, new List<BookNode> { tanach }) != null, "compare: a whole category instead of one book is a difference (never wider)");
+
+            Throws(() => Tools.CheckScope(1, new List<string> { "דניאל" }), "cannot be used together", "scope: books with all_databases true");
+            Tools.CheckScope(0, new List<string> { "דניאל" }); Tools.CheckScope(-1, new List<string> { "דניאל" }); Tools.CheckScope(1, null);
+            Check(true, "scope: books with all_databases false or omitted, and no books, are fine");
+            Throws(() => Tools.CheckScope(-1, new List<string>()), "at least one", "scope: empty books");
+            Check(Tools.NeedsFreshScope(true, null) && !Tools.NeedsFreshScope(false, null) && !Tools.NeedsFreshScope(true, new List<string> { "x" }),
+                "scope: a search without books after a scoped one restarts the instance");
+
+            // the real schema of search
+            var defs = ToolDefs.Build(null);
+            var search = defs.First(d => d.Name == "search");
+            var props = (Dictionary<string, object>)search.Schema["properties"];
+            var bs = (Dictionary<string, object>)props["books"];
+            Check((string)bs["type"] == "array" && Convert.ToInt32(bs["maxItems"]) == BookMatch.MaxBooks && Convert.ToInt32(bs["minItems"]) == 1, "schema: books is an array of at most 20");
+            var v = McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList { " דניאל ", "אסתר" }));
+            var vl = v["books"] as List<string>;
+            Check(vl != null && vl.SequenceEqual(new[] { "דניאל", "אסתר" }), "validate: books trimmed into a list");
+            Check(McpServer.Validate(search.Schema, A("query", "x", "books", new object[] { "דניאל" }))["books"] is List<string>, "validate: object[] accepted");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", "דניאל")), "array of strings", "validate: a string is not an array");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList { 5 })), "array of strings", "validate: non-string item");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList())), "at least 1", "validate: empty array");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList(Enumerable.Repeat("a", 21).ToList()))), "at most 20", "validate: too many");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList { " " })), "empty string", "validate: blank item");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList { new string('א', 121) })), "too long", "validate: long item");
+            Throws(() => McpServer.Validate(search.Schema, A("query", "x", "books", new System.Collections.ArrayList { "a\nb" })), "single lines", "validate: multi-line item");
+            var lim = (Dictionary<string, object>)props["limit"];
+            Check(Convert.ToInt32(lim["maximum"]) == Tools.MaxResultsPerCall, "schema: per-call result cap unchanged");
+        }
+
         static void ParseTests(string dir)
         {
             string q;
@@ -427,6 +541,25 @@ namespace ResponsaMcp
                 Check(items[1].Snippet == "שורה ראשונה של הקטע. שורה שנייה של הקטע.", "results: multi-line snippet joined");
                 Check(items[2].Source.StartsWith("ספר שלישי") && items[2].Snippet.Contains("2. לא מספר תוצאה"), "results: a numbered line inside a snippet stays in the snippet");
             }
+            // IT-789: a saved file still open by its writer is read only after it is closed
+            string tmp = Path.Combine(Path.GetTempPath(), "rmcp-locked-" + Guid.NewGuid().ToString("N") + ".txt");
+            try
+            {
+                var w = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.Read);
+                var bytes = new byte[] { 0xFF, 0xFE }.Concat(Encoding.Unicode.GetBytes("שלום")).ToArray();
+                w.Write(bytes, 0, bytes.Length); w.Flush();
+                var closer = new System.Threading.Thread(() => { System.Threading.Thread.Sleep(400); w.Dispose(); });
+                closer.Start();
+                Check(SaveParse.ReadSaved(tmp, 5000) == "שלום", "read saved: waits until the writer closes the file");
+                closer.Join();
+                var w2 = new FileStream(tmp, FileMode.Open, FileAccess.Write, FileShare.Read);
+                bool threw = false;
+                try { SaveParse.ReadSaved(tmp, 300); } catch (IOException) { threw = true; }
+                w2.Dispose();
+                Check(threw, "read saved: still open after the wait is an error, not a partial read");
+            }
+            finally { try { File.Delete(tmp); } catch { } }
+
             string title;
             string text = SaveParse.ParseText(SaveParse.ReadSaved(Path.Combine(dir, "text.txt")), out title);
             Check(title == "ספר לדוגמה דף ב עמוד א", "text: title");

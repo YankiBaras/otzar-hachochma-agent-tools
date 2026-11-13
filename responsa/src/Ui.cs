@@ -24,6 +24,8 @@ namespace ResponsaMcp
         public const int RangeFrom = 1618, RangeTo = 1619, RangeMark = 1620, RangeUnmark = 1061, RangeOk = 1;
         // "עיון" → "כתיבת מקורות" page
         public const int RefEdit = 1021, RefFind = 1187, RefList = 1617, RefShow = 1;
+        // IT-789: search dialog → databases (1210) → "ניהול המאגרים", page "עץ מקורות"
+        public const int Databases = 1210, DbTree = 1002, DbSelectedView = 1199, DbReset = 1136, DbTitle = 1212, DbOk = 1649, DbCancel = 1651;
     }
 
     internal static class Ui
@@ -204,6 +206,159 @@ namespace ResponsaMcp
             return s;
         }
 
+        // ------------------------------------------------------------------ book scope (IT-789, see Books.cs)
+        static bool IsChooser(IntPtr d) { return Win.Text(d) == "ניהול המאגרים"; }
+        static IntPtr TreePage(IntPtr sheet)
+        {
+            foreach (var k in Win.Kids(sheet)) if (Win.Class(k) == "#32770" && Win.Text(k) == "עץ מקורות" && Native.IsWindowVisible(k)) return k;
+            return Z;
+        }
+        static bool SelectedView(IntPtr page) { return Win.Text(Win.Kid(page, Ids.DbTitle)).Contains("שנבחרו"); }
+
+        /// <summary>A dialog of ours other than the search dialog and the chooser (a warning): fatal for this operation.</summary>
+        static void CheckNoMessage(uint pid)
+        {
+            foreach (var d in Win.Dialogs(pid))
+            {
+                if (IsSearchDialog(d) || IsIyun(d) || IsChooser(d)) continue;
+                // Measured: the "הקובץ נשמר" box of an earlier save can still appear after SaveVia returned. Harmless.
+                if (Win.DialogMessage(d).Contains("הקובץ נשמר")) { Dismiss(d); continue; }
+                string fatal = FatalText(d);
+                if (fatal != null) throw new FatalDialogError(fatal);
+                throw new StuckError("Responsa showed '" + Win.Text(d) + "': " + Win.DialogMessage(d) + " while the books were selected");
+            }
+        }
+
+        /// <summary>
+        /// IT-789: selects exactly the named books in the instance's database chooser and confirms it. `changing` is called
+        /// just before the instance's selection is first changed (a name error leaves it untouched). Returns the selected
+        /// nodes as Responsa's "selected" view shows them, and notes on names taken from several places. Throws ToolError
+        /// for a name that matches nothing or several places, StuckError if the selection could not be made or read back
+        /// as asked (the caller then restarts the instance, which drops whatever was selected).
+        /// </summary>
+        public static BookSelection SelectBooks(uint pid, IList<string> entries, BookIndexCache cache, Action changing)
+        {
+            // Measured: a message box of an earlier call can appear late ("לא נמצאה כל תוצאה!" after a failed open_text,
+            // "הקובץ נשמר" after a save). Before anything is changed, such boxes are answered by their own button, as
+            // Search does; an internal error or a box without a known button still throws (Dismiss).
+            foreach (var d in Win.Dialogs(pid))
+                if (!IsSearchDialog(d) && !IsIyun(d) && !IsChooser(d) && Win.Text(d).Length > 0) Dismiss(d);
+            IntPtr adv = OpenAdvanced(pid);
+            IntPtr sheet = Win.Dialogs(pid).FirstOrDefault(IsChooser);
+            if (sheet == Z) { Win.Press(adv, Ids.Databases); sheet = WaitDialog(pid, IsChooser, 10000); }
+            if (sheet == Z) throw new StuckError("the Responsa database chooser did not open");
+            IntPtr page = TreePage(sheet);
+            if (page == Z) { Win.Send(sheet, Native.PSM_SETCURSEL, 0, 0); Thread.Sleep(600); page = TreePage(sheet); }
+            if (page == Z) throw new StuckError("the 'עץ מקורות' page of the database chooser did not open");
+            bool done = false;
+            try
+            {
+                if (SelectedView(page)) { Win.Press(page, Ids.DbSelectedView); WaitView(page, false); }
+                List<BookNode> asked, shown; List<string> notes;
+                using (var tree = new RemoteTree(Win.Kid(page, Ids.DbTree)))
+                {
+                    var live = new LiveBookTree(tree, cache);
+                    try { asked = BookMatch.ResolveAll(live, entries, out notes); }
+                    catch (BookTreeChanged) { cache.Top = null; asked = BookMatch.ResolveAll(live, entries, out notes); }
+
+                    changing();
+                    Win.Press(page, Ids.DbReset);
+                    WaitTree(tree, t => t.Count > 0 && t.Children(IntPtr.Zero).All(i => t.Image(i) == RemoteTree.NotSelected), "clear the selection");
+                    CheckNoMessage(pid);
+                    foreach (var n in asked) Toggle(tree, n);
+                    CheckNoMessage(pid);
+                }
+                // Read back what is selected, from Responsa's own "selected" view.
+                Win.Press(page, Ids.DbSelectedView);
+                WaitView(page, true);
+                CheckNoMessage(pid);
+                using (var tree = new RemoteTree(Win.Kid(page, Ids.DbTree))) shown = ReadSelected(tree, asked);
+                string diff = BookMatch.Compare(asked, shown);
+                if (diff != null) throw new StuckError("Responsa did not select the books as asked (" + diff + ")");
+
+                Win.Press(page, Ids.DbOk);
+                var sw = Stopwatch.StartNew();
+                while (Native.IsWindow(sheet) && Native.IsWindowVisible(sheet) && sw.ElapsedMilliseconds < 8000) { Thread.Sleep(150); CheckNoMessage(pid); }
+                if (Native.IsWindow(sheet) && Native.IsWindowVisible(sheet)) throw new StuckError("the database chooser did not close");
+                Thread.Sleep(200);
+                CheckNoMessage(pid);
+                done = true;
+                return new BookSelection { Nodes = shown, Notes = notes };
+            }
+            catch (BookTreeChanged) { cache.Top = null; throw; }   // read the tree names again next time
+            finally
+            {
+                // A name error (or anything before OK): close the chooser without applying it.
+                if (!done && Native.IsWindow(sheet) && Native.IsWindowVisible(sheet) && Native.IsWindow(page))
+                {
+                    Win.Press(page, Ids.DbCancel);
+                    var sw = Stopwatch.StartNew();
+                    while (Native.IsWindow(sheet) && Native.IsWindowVisible(sheet) && sw.ElapsedMilliseconds < 5000) Thread.Sleep(150);
+                }
+            }
+        }
+
+        static void WaitView(IntPtr page, bool selected)
+        {
+            var sw = Stopwatch.StartNew();
+            while (SelectedView(page) != selected && sw.ElapsedMilliseconds < 5000) Thread.Sleep(100);
+            if (SelectedView(page) != selected) throw new StuckError("the database chooser did not switch its view");
+            Thread.Sleep(300);
+        }
+
+        static void WaitTree(RemoteTree t, Func<RemoteTree, bool> ok, string what)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 15000) { if (ok(t)) return; Thread.Sleep(150); }
+            throw new StuckError("Responsa's database chooser did not " + what);
+        }
+
+        /// <summary>Selects one node: found by its position, checked by name, clicked unless already selected, verified.</summary>
+        static void Toggle(RemoteTree t, BookNode n)
+        {
+            IntPtr item = t.At(n.Path);
+            if (item == IntPtr.Zero || t.Text(item) != n.Name) throw new BookTreeChanged();
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (t.Image(item) == RemoteTree.Selected) return;
+                t.Click(item);
+                var sw = Stopwatch.StartNew();
+                while (t.Image(item) != RemoteTree.Selected && sw.ElapsedMilliseconds < 1500) Thread.Sleep(100);
+            }
+            if (t.Image(item) != RemoteTree.Selected) throw new StuckError("could not select '" + n.Display + "' in Responsa's database chooser");
+        }
+
+        /// <summary>
+        /// Walks the "selected" view: a node with image Selected is taken whole; a partly selected one is opened. Its nodes
+        /// are mapped back to positions in the full tree through the asked nodes' names (the view keeps only the selected
+        /// branches, so positions differ); a node no asked path explains gets a negative position, so it never matches.
+        /// </summary>
+        static List<BookNode> ReadSelected(RemoteTree t, List<BookNode> asked)
+        {
+            var shown = new List<BookNode>();
+            int unknown = 0;
+            Action<IntPtr, string[], int> walk = null;
+            walk = delegate (IntPtr parent, string[] names, int depth)
+            {
+                if (parent != IntPtr.Zero) t.Expand(parent);
+                foreach (var k in t.Children(parent))
+                {
+                    int img; string text = t.Text(k, out img);
+                    var path = names.Concat(new[] { text }).ToArray();
+                    if (img == RemoteTree.Selected || depth >= 6)
+                    {
+                        // same names as an asked node, or as an ancestor of one: that node's position
+                        var m = asked.FirstOrDefault(a => a.Names.Length >= path.Length && a.Names.Take(path.Length).SequenceEqual(path));
+                        int[] pos = m != null ? m.Path.Take(path.Length).ToArray() : new[] { -(++unknown) };
+                        shown.Add(new BookNode { Path = pos, Names = path });
+                    }
+                    else if (img == RemoteTree.Partly) walk(k, path, depth + 1);
+                }
+            };
+            walk(IntPtr.Zero, new string[0], 0);
+            return shown;
+        }
+
         // ------------------------------------------------------------------ saving
         /// <summary>Marks results [from..to] of a results window (clearing earlier marks) and saves the marked ones.</summary>
         public static string SaveResultRange(uint pid, IntPtr window, int total, int from, int to, string path)
@@ -220,6 +375,13 @@ namespace ResponsaMcp
             Win.Press(r, Ids.RangeMark); Thread.Sleep(400);
             if (Native.IsWindow(r) && Native.IsWindowVisible(r)) { Win.Press(r, Ids.RangeOk); Thread.Sleep(300); }
             return SaveVia(pid, Ids.SaveAllMarked, path);
+        }
+
+        /// <summary>True when no process has the file open (it can be opened with no sharing).</summary>
+        static bool Closed(string path)
+        {
+            try { using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None)) return true; }
+            catch (IOException) { return false; }
         }
 
         static bool IsFileDialog(IntPtr d)
@@ -260,7 +422,9 @@ namespace ResponsaMcp
                     if (msg.Contains("נשמר") || Win.Text(d) == path) { Dismiss(d); return path; }
                     if (msg.Length > 0) { Dismiss(d); throw new ToolError("Responsa did not save: " + msg); }
                 }
-                if (!Native.IsWindow(sv) && File.Exists(path) && new FileInfo(path).Length > 0 && sw.ElapsedMilliseconds > 2000) return path;
+                // IT-789 (found by the live test): Responsa keeps the file open until its "הקובץ נשמר" box is answered,
+                // and that box can come late. Without the box, return only once Responsa has closed the file.
+                if (!Native.IsWindow(sv) && File.Exists(path) && new FileInfo(path).Length > 0 && sw.ElapsedMilliseconds > 2000 && Closed(path)) return path;
             }
             throw new StuckError("saving did not finish");
         }
