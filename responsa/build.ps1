@@ -2,7 +2,9 @@
 # Nothing is downloaded. x86, to match the 32-bit Responsa (cross-process list reads use the 32-bit layout).
 #   .\build.ps1          build the server
 #   .\build.ps1 -Test    also build and run the offline tests (no Responsa needed)
-param([switch]$Test)
+#   .\build.ps1 -DialogTest   IT-827: also drive the Save As code against a scratch program's Save As windows (both
+#                        kinds) on a private desktop (no Responsa needed, nothing shown, about a minute)
+param([switch]$Test, [switch]$DialogTest)
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $fw = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319'
@@ -25,4 +27,16 @@ if ($Test) {
     if ($LASTEXITCODE) { throw "test build failed" }
     & $texe (Join-Path $here 'test\samples')
     if ($LASTEXITCODE) { throw "offline tests failed" }
+}
+
+if ($DialogTest) {
+    $hexe = Join-Path $dist 'responsa-mcp-savehost.exe'
+    & $csc /nologo /target:winexe /platform:x86 /codepage:65001 "/out:$hexe" (Join-Path $here 'test\SaveAsHost.cs')
+    if ($LASTEXITCODE) { throw "save-as host build failed" }
+    $dsrc = @($src | Where-Object { (Split-Path $_ -Leaf) -ne 'Program.cs' }) + (Join-Path $here 'test\SaveDialogTest.cs')
+    $dexe = Join-Path $dist 'responsa-mcp-dialogtest.exe'
+    & $csc /nologo /target:exe /platform:x86 /codepage:65001 "/out:$dexe" @refs @dsrc
+    if ($LASTEXITCODE) { throw "dialog test build failed" }
+    & $dexe
+    if ($LASTEXITCODE) { throw "dialog tests failed" }
 }

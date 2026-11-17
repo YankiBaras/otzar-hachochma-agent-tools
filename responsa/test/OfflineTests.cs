@@ -29,6 +29,7 @@ namespace ResponsaMcp
             ParseTests(samples);
             WorkspaceGuardTests();
             WorkspaceFileTests();
+            InstallTests();
             BookTests();
             DpiTests();
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
@@ -333,6 +334,32 @@ namespace ResponsaMcp
             finally { try { Directory.Delete(root, true); } catch { } }
         }
 
+        // ---- IT-827: with several installs the newest is used; RESPONSA_MCP_EXE overrides; status lists them all
+        static void InstallTests()
+        {
+            Func<string, string, Install> I = (dir, v) => new Install { Exe = dir + @"\RESPONSA.exe", Dir = dir, DataDir = dir + "-data", Version = v, Number = new System.Version(v), Source = "Program Files" };
+            var r31 = I(@"C:\P\ResponsaCD31C", "31.0.0.0"); var r34 = I(@"C:\P\ResponsaCD34C", "34.0.0.0"); var r29 = I(@"C:\P\ResponsaCD29C", "29.0.0.0");
+            var all = new List<Install> { r31, r34, r29 };
+            Check(Install.Choose(all, null) == r34 && r34.All.Count == 3, "install: the newest of 31, 34, 29 is 34 (the first found was 31)");
+            Check(Install.Choose(new List<Install> { r29, I(@"C:\P\ResponsaCD29D", "29.0.1.0") }, null).Dir.EndsWith("29D"), "install: a newer build of the same major wins");
+            Check(Install.Choose(new List<Install> { r31, r34 }, r31) == r31, "install: RESPONSA_MCP_EXE overrides the newest");
+            Check(Install.Choose(new List<Install>(), null) == null, "install: none found");
+            var unread = I(@"C:\P\ResponsaX", "0.0.0.0"); unread.Version = "?";
+            Check(Install.Choose(new List<Install> { unread, r29 }, null) == r29, "install: an unreadable version never wins over a readable one");
+            var rep = Install.Choose(all, null).Report();
+            Check(rep.Count == 3 && rep.Cast<Dictionary<string, object>>().Count(d => (bool)d["used"]) == 1
+                && (string)((Dictionary<string, object>)rep.Cast<Dictionary<string, object>>().First(d => (bool)d["used"]))["version"] == "34.0.0.0"
+                && (string)((Dictionary<string, object>)rep[0])["data_folder"] == r31.DataDir, "install: report lists every install, the used one marked, with its data folder");
+            string old = Environment.GetEnvironmentVariable("RESPONSA_MCP_EXE");
+            try
+            {
+                Environment.SetEnvironmentVariable("RESPONSA_MCP_EXE", @"C:
+o\such\RESPONSA.exe");
+                Throws(() => Install.Find(), "no such file", "install: RESPONSA_MCP_EXE naming no file is an error, not a silent fallback");
+            }
+            finally { Environment.SetEnvironmentVariable("RESPONSA_MCP_EXE", old); }
+        }
+
         // ---- IT-785: the workspace file is found by name (Responsa versions other than 29)
         static void WorkspaceFileTests()
         {
@@ -378,7 +405,7 @@ namespace ResponsaMcp
                 var rep = Tools.VersionReport(ins29, several);
                 Check((bool)rep["version_tested"] && !rep.ContainsKey("version_note") && (string)rep["workspace_file"] == "several" && ((List<object>)rep["workspace_files"]).Count == 2, "report: 29 tested, several files listed");
                 rep = Tools.VersionReport(new Install { Version = "30.0.0.0", Major = 30 }, one);
-                Check(!(bool)rep["version_tested"] && ((string)rep["version_note"]).Contains("not tested yet") && (string)rep["workspace_file"] == one.Path, "report: 30 not tested (not refused), file shown");
+                Check(!(bool)rep["version_tested"] && ((string)rep["version_note"]).Contains("expected to work") && (string)rep["workspace_file"] == one.Path, "report: 30 not tested (not refused), file shown");
                 rep = Tools.VersionReport(ins29, none);
                 Check(((string)rep["workspace_file"]).StartsWith("none"), "report: none");
 
@@ -586,9 +613,11 @@ namespace ResponsaMcp
                 closer.Join();
                 var w2 = new FileStream(tmp, FileMode.Open, FileAccess.Write, FileShare.Read);
                 bool threw = false;
-                try { SaveParse.ReadSaved(tmp, 300); } catch (IOException) { threw = true; }
+                try { SaveParse.ReadSaved(tmp, 300); } catch (ToolError e) { threw = e.Message.Contains("kept the saved file open"); }
                 w2.Dispose();
                 Check(threw, "read saved: still open after the wait is an error, not a partial read");
+                // IT-827: no file at the tool's path is a ToolError, never a raw FileNotFoundException
+                Throws(() => SaveParse.ReadSaved(tmp + ".missing", 300), "did not save to the tool's path", "read saved: missing file");
             }
             finally { try { File.Delete(tmp); } catch { } }
 

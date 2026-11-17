@@ -1,6 +1,6 @@
 # Bar-Ilan Responsa for AI agents: `responsa-mcp` (IT-780)
 
-Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and read the user's own licensed **Bar-Ilan Responsa Project v29** (פרויקט השו"ת) in the background, while the user keeps working in their own Responsa.
+Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and read the user's own licensed **Bar-Ilan Responsa Project** (פרויקט השו"ת) in the background, while the user keeps working in their own Responsa. Tested live on Responsa 29; other versions are expected to work (see "Responsa versions").
 
 ## How it works
 
@@ -8,7 +8,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
 - It drives that instance only with Win32 messages to its own process:
   - search dialog, results window, "כתיבת מקורות"
   - the search dialog's database chooser, when a search is limited to books (IT-789): a click posted to its own hidden tree window, not real mouse input
-  - Responsa's own File → Save, which writes Unicode text to the tool's temp folder; the tool reads the file and deletes it
+  - Responsa's own File → Save, which writes Unicode text to the tool's temp folder; the tool reads the file and deletes it (see "The Save As window" below)
 - It never reads Responsa's content files (the books and their indexes) and never drives or ends the user's Responsa. It reads two small files:
   - `Responsa.env`, to find the data folder
   - the workspace autosave `DATA\responsaext1.029` (on Responsa 29; see "Responsa versions" below), which it copies, compares and may put back
@@ -26,7 +26,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
      { "mcpServers": { "responsa": { "command": "C:\\Users\\<you>\\AppData\\Local\\ResponsaMcp\\bin\\responsa-mcp.exe" } } }
      ```
 4. Install the skill: copy `skill\responsa` to `%USERPROFILE%\.claude\skills\`, or upload it as a skill in Claude.
-5. Check: `responsa-mcp.exe doctor` first prints the Responsa version and the workspace file it found (`install:`), then starts the private instance, runs a control search, opens one text and stops. It takes about 15 seconds.
+5. Check: `responsa-mcp.exe doctor` first prints the Responsa version, the workspace file it found and every Responsa install found (`install:`). It then starts the private instance, runs a control search, opens one text, prints how the Save As window went (`save_dialog:`) and stops. It takes about 15 seconds. When something fails on your Responsa version, send this output.
 
 The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs Responsa.
 
@@ -34,7 +34,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 
 | Tool | Does |
 |---|---|
-| `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), the workspace file it protects (`workspace_file`) and open searches. |
+| `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), every install found (`responsa_installs`, the one used marked), the workspace file it protects (`workspace_file`) and open searches. |
 | `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. Optional `books`: search only named books (see below). |
 | `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. Each result has its real number `n` in the search. If Responsa's save holds anything but exactly the asked results, nothing is returned: the call fails and the instance is restarted (earlier `search_id`s are gone). |
 | `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. |
@@ -85,12 +85,34 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 - Per call: at most 50 results and 60,000 characters of text. Extraction is meant to be small and per question.
 - Responsa refuses searches with more than 32,000 results.
 - One search at a time per server. Each MCP client process gets its own private instance.
-- Tested on Responsa 29.0 (ResponsaCD29C, "29 ragil DISKLESS") on Windows 11. Other versions: see below.
+- Tested live on Responsa 29.0 (ResponsaCD29C, "29 ragil DISKLESS") on Windows 11. Other versions: see below.
 
 ## Responsa versions
 
-- **Tested:** Responsa 29 only. On that version every data file ends in `.029`, so the suffix is taken to be the version number. That is an inference, not checked on another version.
-- **Other versions are not refused.** `status` and `doctor` show `version_tested: false` and a note. Search, `open_text` and the window commands are expected to work unchanged, because versions differ in content; that is not tested yet.
+- **Tested live:** Responsa 29 only. On that version every data file ends in `.029`, so the suffix is taken to be the version number. That is an inference, not checked on another version.
+- **Other versions are expected to work, and are not refused.** `status` and `doctor` show `version_tested: false` and a note. Pilot users reported Responsa 31 and 34; the Save As handling below was changed for what they saw (IT-827).
+- **Report problems with the output of `responsa-mcp.exe doctor`.** Where a window of another version differs from Responsa 29 (a control the tool measured on 29 is missing, the Save As window is not recognized, or Responsa saves elsewhere), the tool returns an error that names the version and the step. It never returns a raw exception or text from another file.
+- **Several versions installed:** the tool collects every install it finds (the uninstall registry and `Program Files\Responsa*`) and uses the newest by file version. Its data folder (`Responsa.env`) and workspace file are those of that install. `status` and `doctor` list every install found under `responsa_installs`, with the one used marked `used: true`.
+  - `RESPONSA_MCP_EXE` still overrides the choice. If it is set to a path that does not exist, the tool says so instead of falling back to another install.
+
+### The Save As window (IT-827)
+
+The tool gets text out through Responsa's own File → Save, so it must fill Responsa's Save As window. Windows has two kinds:
+
+- **The common item dialog** (folder tree, address bar). Responsa 29 on Windows 11 shows this one, as does Responsa 34 (pilot report).
+- **The classic dialog**, which older programs or other settings may show.
+
+The tool recognizes both by their parts: the file-name field (the one visible edit inside a combo box outside the address bar), the type box and the Save button. Then it does the following:
+
+1. It waits until the window has finished putting in its default name.
+2. If the type box has a "UNICODE" entry and another type is chosen, it chooses the Unicode one, the way a pick from the list would.
+3. It types the tool's path into the file-name field and checks that the field still holds exactly that path a moment later.
+4. It presses Save. The save counts only if the file appears at the tool's own path. A file Responsa wrote elsewhere (for example `respsrch` in Responsa's own `TEMP` folder) is never read.
+5. If Responsa saved elsewhere, the save is repeated once, with the path put in by `WM_SETTEXT` instead of typed. If that also fails, the error names the version and says what the window did (also printed by `doctor` as `save_dialog`).
+
+Why typing: a pilot user's Responsa 34 saved to its default name `respsrch` even though the tool had put its path in the field. A scratch program on this PC shows the same with the item dialog: after its type changes, the dialog resets the name to its default. It then saves under that internal name, even while the field shows a path put in by `WM_SETTEXT`. A typed path is taken. Measured on Responsa 29: both ways work, and 16 saves in a row went through on the typed first round. Once in a live run, the typed round did not reach the tool's path and the second round saved correctly; the cause was not found.
+
+`build.ps1 -DialogTest` drives this code against a scratch program's Save As windows on a private desktop: both kinds, a type that starts on the non-Unicode entry, a name reset after the window is shown, a program that saves elsewhere, and a window that never keeps the path. No Responsa is needed.
 - **Which workspace file is protected:** the tool looks in `DATA\` for `responsaext1.0NN` (three digits, the first `0`; a longer name such as `responsaext1.029_` does not count). It decides once, each time its instance starts:
   - **One such file:** that file is protected, as described above.
   - **None:** the name this version is expected to create (`responsaext1.030` for Responsa 30; `.029` if the version cannot be read) is protected as a file that did not exist before, so a file only the tool's instance creates there is removed.
@@ -110,9 +132,11 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
   - `WorkspaceGuard.cs`: workspace protection
   - `Proc.cs`: process identity (handle + creation time)
   - `Ui.cs`: Responsa UI operations and the measured command/control IDs
+  - `SaveDialog.cs`: recognizing and filling the Save As window, both kinds (IT-827)
   - `UiThread.cs`: the private desktop and the error types
   - `Native.cs`: Win32
   - `SaveParse.cs`: parsing the saved files
 - `build.ps1 -Test`: builds and runs the offline tests (`test/OfflineTests.cs`, synthetic samples in `test/samples`).
+- `build.ps1 -DialogTest`: builds `test/SaveAsHost.cs` (a scratch program with a Save As window, never shipped) and `test/SaveDialogTest.cs`, and drives the Save As code against it on a private desktop. It needs no Responsa, shows nothing on screen and takes about a minute.
 - `test/live-mcp.ps1`: end-to-end test through MCP. It needs Responsa. Run it with PowerShell 7 (`pwsh`): the file is UTF-8 without a BOM.
 - Design notes and the measurements behind the IDs are in `docs/responsa-mcp-plan.md`. That file is local and not committed.

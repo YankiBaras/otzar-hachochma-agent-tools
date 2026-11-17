@@ -96,6 +96,7 @@ namespace ResponsaMcp
                 r["responsa_exe"] = inst.Install.Exe;
                 foreach (var kv in VersionReport(inst.Install, inst.Workspace)) r[kv.Key] = kv.Value;
                 r["data_folder"] = inst.Install.DataDir;
+                r["responsa_installs"] = inst.Install.Report();   // IT-827: every install found, the one used marked
                 r["instance_pid"] = (long)inst.Pid;
                 r["private_desktop"] = ui.DesktopName;
                 r["editor_responsa_running"] = inst.EditorInstances();
@@ -118,6 +119,7 @@ namespace ResponsaMcp
             r["responsa_exe"] = ins.Exe;
             foreach (var kv in VersionReport(ins, WorkspaceFile.Find(ins.DataDir, ins.Major))) r[kv.Key] = kv.Value;
             r["data_folder"] = ins.DataDir;
+            r["responsa_installs"] = ins.Report();   // IT-827
             return r;
         }
 
@@ -129,7 +131,7 @@ namespace ResponsaMcp
             bool tested = ins.Major == WorkspaceFile.TestedMajor;
             r["version_tested"] = tested;
             if (!tested)
-                r["version_note"] = "responsa-mcp was tested on Responsa " + WorkspaceFile.TestedMajor + " only. This version is not tested yet: it is not refused, but report any problem.";
+                r["version_note"] = "responsa-mcp was tested live on Responsa " + WorkspaceFile.TestedMajor + " only. Other versions are expected to work; if something fails, report it with the output of responsa-mcp.exe doctor.";
             if (ws == null) return r;
             if (ws.State == "found") r["workspace_file"] = ws.Path;
             else if (ws.State == "none") r["workspace_file"] = "none yet (protected as a new file: " + ws.Path + ")";

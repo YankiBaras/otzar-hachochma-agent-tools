@@ -23,6 +23,7 @@ namespace ResponsaMcp
         /// IT-789 (found by the live test): Ui.SaveVia can return while Responsa still has the file open for writing
         /// ("being used by another process"). The file is read only once it can be opened with no sharing, i.e. once
         /// Responsa has closed it, so a half-written file is never parsed. Waits up to waitMs, then fails as before.
+        /// IT-827: both failures are ToolErrors that say what happened (a pilot user got a raw FileNotFoundException).
         /// </summary>
         public static string ReadSaved(string path, int waitMs)
         {
@@ -41,7 +42,9 @@ namespace ResponsaMcp
                 }
                 catch (IOException)
                 {
-                    if (!File.Exists(path) || sw.ElapsedMilliseconds >= waitMs) throw;
+                    if (!File.Exists(path))
+                        throw new ToolError(Ui.Version + " did not save to the tool's path (" + path + "); nothing was read. Please report this with the output of responsa-mcp.exe doctor.");
+                    if (sw.ElapsedMilliseconds >= waitMs) throw new ToolError(Ui.Version + " kept the saved file open for more than " + waitMs / 1000.0 + " s; nothing was read");
                     System.Threading.Thread.Sleep(100);
                 }
             }

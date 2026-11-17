@@ -69,9 +69,12 @@ namespace ResponsaMcp
                 o.WriteLine("status: " + McpServer.Serialize(tools.Status()));
                 o.WriteLine("search: " + McpServer.Serialize(tools.Search(query, 1, null, 3, 180)));
                 o.WriteLine("open_text: " + Trim(McpServer.Serialize(tools.OpenText("בבלי ברכות ב א", 600, 30))));
+                o.WriteLine("save_dialog: " + Ui.LastSave);   // IT-827: which Save As window this version showed
                 return 0;
             }
-            catch (ToolError e) { o.WriteLine("ERROR: " + e.Message); return 1; }
+            catch (ToolError e) { o.WriteLine("ERROR: " + e.Message); o.WriteLine("save_dialog: " + Ui.LastSave); return 1; }
+            // IT-827: anything else is reported too, never a raw exception without the context above
+            catch (Exception e) { o.WriteLine("ERROR (internal): " + e.GetType().Name + ": " + e.Message); o.WriteLine("save_dialog: " + Ui.LastSave); return 1; }
         }
 
         /// <summary>Removes temp folders of servers that are gone (a crash may have left extracted text there).</summary>

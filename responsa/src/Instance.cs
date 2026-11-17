@@ -17,13 +17,73 @@ namespace ResponsaMcp
         public string DataDir;   // folder holding Responsa.ini and DATA\
         public string Version;   // file version
         public int Major;        // major part of the file version (29 for Responsa 29); 0 if it could not be read
+        public System.Version Number;   // IT-827: the full file version, to compare installs; 0.0.0.0 if it could not be read
+        public string Source;    // IT-827: where it was found: "RESPONSA_MCP_EXE", "registry" or "Program Files"
+        public List<Install> All = new List<Install>();   // IT-827: every install found (this one included), for status/doctor
 
-        /// <summary>Finds the installation: RESPONSA_MCP_EXE, then the uninstall registry, then Program Files.</summary>
+        /// <summary>
+        /// IT-827: finds every installation (the uninstall registry and Program Files\Responsa*) and uses the newest by
+        /// file version. Measured by a pilot user: with Responsa 31 and 34 installed, the first one found was 31.
+        /// RESPONSA_MCP_EXE still overrides; if it is set but names no file, that is an error, never a silent fallback.
+        /// </summary>
         public static Install Find()
         {
-            var candidates = new List<string>();
             string env = Environment.GetEnvironmentVariable("RESPONSA_MCP_EXE");
-            if (!string.IsNullOrEmpty(env)) candidates.Add(env);
+            var found = new List<Install>();
+            foreach (var c in Candidates())
+            {
+                if (!File.Exists(c.Key)) continue;
+                string full = Path.GetFullPath(c.Key);
+                if (found.Any(i => string.Equals(i.Exe, full, StringComparison.OrdinalIgnoreCase))) continue;
+                found.Add(Describe(full, c.Value));
+            }
+            Install env1 = null;
+            if (!string.IsNullOrEmpty(env))
+            {
+                if (!File.Exists(env)) throw new ToolError("RESPONSA_MCP_EXE is set to " + env + ", but there is no such file. Set it to the full path of RESPONSA.exe, or remove it to use the newest Responsa installed.");
+                string full = Path.GetFullPath(env);
+                env1 = found.FirstOrDefault(i => string.Equals(i.Exe, full, StringComparison.OrdinalIgnoreCase));
+                if (env1 == null) { env1 = Describe(full, "RESPONSA_MCP_EXE"); found.Add(env1); }
+                else env1.Source = "RESPONSA_MCP_EXE";
+            }
+            var use = Choose(found, env1);
+            if (use == null) throw new ToolError("Responsa (Bar-Ilan Responsa Project) was not found on this PC. Set RESPONSA_MCP_EXE to the full path of RESPONSA.exe.");
+            return use;
+        }
+
+        /// <summary>IT-827: RESPONSA_MCP_EXE if set, otherwise the newest file version (the first found on a tie).</summary>
+        internal static Install Choose(List<Install> found, Install env)
+        {
+            if (found.Count == 0) return null;
+            Install use = env;
+            if (use == null)
+            {
+                use = found[0];
+                foreach (var i in found) if (i.Number > use.Number) use = i;
+            }
+            use.All = found;
+            return use;
+        }
+
+        static Install Describe(string exe, string source)
+        {
+            var ins = new Install { Exe = exe, Source = source, Number = new System.Version(0, 0, 0, 0) };
+            ins.Dir = Path.GetDirectoryName(exe);
+            ins.DataDir = ReadDataLocation(ins.Dir);
+            try
+            {
+                var fv = FileVersionInfo.GetVersionInfo(exe);
+                ins.Version = fv.FileVersion; ins.Major = fv.FileMajorPart;
+                ins.Number = new System.Version(fv.FileMajorPart, fv.FileMinorPart, fv.FileBuildPart, fv.FilePrivatePart);
+            }
+            catch { ins.Version = "?"; }
+            return ins;
+        }
+
+        /// <summary>Candidate RESPONSA.exe paths: the uninstall registry, then Program Files\Responsa*.</summary>
+        static List<KeyValuePair<string, string>> Candidates()
+        {
+            var candidates = new List<KeyValuePair<string, string>>();
             foreach (var root in new[] { Registry.LocalMachine, Registry.CurrentUser })
                 foreach (var path in new[] { @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" })
                 {
@@ -40,7 +100,7 @@ namespace ResponsaMcp
                                     string disp = (s.GetValue("DisplayName") as string) ?? "";
                                     string loc = (s.GetValue("InstallLocation") as string) ?? "";
                                     if (loc.Length > 0 && (pub.IndexOf("Responsa", StringComparison.OrdinalIgnoreCase) >= 0 || disp.StartsWith("Responsa", StringComparison.OrdinalIgnoreCase)))
-                                        candidates.Add(Path.Combine(loc, "RESPONSA.exe"));
+                                        candidates.Add(new KeyValuePair<string, string>(Path.Combine(loc, "RESPONSA.exe"), "registry"));
                                 }
                         }
                     }
@@ -49,19 +109,16 @@ namespace ResponsaMcp
             foreach (var pf in new[] { Environment.GetEnvironmentVariable("ProgramFiles(x86)"), Environment.GetEnvironmentVariable("ProgramFiles") })
             {
                 if (string.IsNullOrEmpty(pf) || !Directory.Exists(pf)) continue;
-                try { foreach (var d in Directory.GetDirectories(pf, "Responsa*")) candidates.Add(Path.Combine(d, "RESPONSA.exe")); } catch { }
+                try { foreach (var d in Directory.GetDirectories(pf, "Responsa*")) candidates.Add(new KeyValuePair<string, string>(Path.Combine(d, "RESPONSA.exe"), "Program Files")); } catch { }
             }
-            foreach (var c in candidates)
-            {
-                if (!File.Exists(c)) continue;
-                var ins = new Install();
-                ins.Exe = Path.GetFullPath(c);
-                ins.Dir = Path.GetDirectoryName(ins.Exe);
-                ins.DataDir = ReadDataLocation(ins.Dir);
-                try { var fv = FileVersionInfo.GetVersionInfo(ins.Exe); ins.Version = fv.FileVersion; ins.Major = fv.FileMajorPart; } catch { ins.Version = "?"; }
-                return ins;
-            }
-            throw new ToolError("Responsa (Bar-Ilan Responsa Project) was not found on this PC. Set RESPONSA_MCP_EXE to the full path of RESPONSA.exe.");
+            return candidates;
+        }
+
+        /// <summary>IT-827: every install found, the one used marked, for status and doctor.</summary>
+        public List<object> Report()
+        {
+            return All.Select(i => (object)new Dictionary<string, object> {
+                { "exe", i.Exe }, { "version", i.Version }, { "data_folder", i.DataDir }, { "found_by", i.Source }, { "used", i == this } }).ToList();
         }
 
         /// <summary>DataLocation from Responsa.env in the program folder; falls back to Public Documents.</summary>
@@ -257,6 +314,7 @@ namespace ResponsaMcp
             if (hProc != IntPtr.Zero && !Stop())
                 throw new ToolError("the previous private Responsa has not exited yet; try again in a moment");
             if (Install == null) Install = Install.Find();
+            Ui.Version = "Responsa " + Install.Version;   // IT-827: named in errors of steps measured on Responsa 29
             if (!Directory.Exists(Install.DataDir)) throw new ToolError("Responsa data folder not found: " + Install.DataDir);
 
             // IT-785: the workspace file is found once per instance start, before anything is copied or launched.

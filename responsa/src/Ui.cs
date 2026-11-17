@@ -106,6 +106,16 @@ namespace ResponsaMcp
             if (ok >= 0) { Win.Press(d, ok); return; }
             throw new FatalDialogError("unexpected Responsa window '" + Win.Text(d) + "': " + Win.DialogMessage(d));
         }
+        /// <summary>
+        /// IT-827: a control whose id was measured on Responsa 29. Missing on this version: a StuckError that names the
+        /// version and the step (the instance is restarted), never an action on a window that is not there.
+        /// </summary>
+        static IntPtr Need(IntPtr dlg, int id, string step)
+        {
+            IntPtr h = Win.Kid(dlg, id);
+            if (h == Z) throw new StuckError(Version + ": the " + step + " has no control " + id + " (the ids were measured on Responsa 29)");
+            return h;
+        }
         static bool IsSearchDialog(IntPtr d) { return Win.Text(d).StartsWith("חיפוש"); }
         static bool IsIyun(IntPtr d) { return Win.Text(d).Contains("עיון"); }
         static bool IsBreakdown(IntPtr d) { return Regex.IsMatch(Win.Text(d), @"^\d+ תוצאות") && Win.KidOfClass(d, "SysListView32") != Z; }
@@ -131,7 +141,7 @@ namespace ResponsaMcp
             IntPtr s = Win.Dialogs(pid).FirstOrDefault(IsSearchDialog);
             if (s == Z) { Command(pid, Ids.Search); s = WaitDialog(pid, IsSearchDialog, 10000); }
             if (s == Z) throw new StuckError("the Responsa search window did not open");
-            if (Win.Text(s) != "חיפוש מתקדם") Win.Press(s, Ids.AdvancedType);
+            if (Win.Text(s) != "חיפוש מתקדם") { Need(s, Ids.AdvancedType, "search window"); Win.Press(s, Ids.AdvancedType); }
             a = WaitTitle(pid, "חיפוש מתקדם", 10000);
             if (a == Z) throw new StuckError("could not switch Responsa to advanced search");
             return a;
@@ -150,10 +160,14 @@ namespace ResponsaMcp
             var res = new SearchOutcome();
             var before = new HashSet<long>(MdiChildren(pid).Select(h => h.ToInt64()));
             IntPtr a = OpenAdvanced(pid);
-            if (allDatabases >= 0) Win.Send(Win.Kid(a, Ids.AllDatabases), Native.BM_SETCHECK, allDatabases, 0);
-            Win.SetText(Win.Kid(a, Ids.AdvQuery), query);
+            if (allDatabases >= 0) Win.Send(Need(a, Ids.AllDatabases, "advanced search window"), Native.BM_SETCHECK, allDatabases, 0);
+            IntPtr q = Need(a, Ids.AdvQuery, "advanced search window");
+            IntPtr run = Need(a, Ids.RunSearch, "advanced search window");
+            Win.SetText(q, query);
+            // IT-827: the query is read back before the search runs, so a field that did not take it never runs another query.
+            if (Win.Text(q) != query) throw new StuckError(Version + ": the advanced search window did not take the query");
             var sw = Stopwatch.StartNew();
-            Win.Click(Win.Kid(a, Ids.RunSearch));
+            Win.Click(run);
             double messageAt = -1;
             while (sw.Elapsed.TotalSeconds < timeoutSec)
             {
@@ -245,11 +259,12 @@ namespace ResponsaMcp
                 if (!IsSearchDialog(d) && !IsIyun(d) && !IsChooser(d) && Win.Text(d).Length > 0) Dismiss(d);
             IntPtr adv = OpenAdvanced(pid);
             IntPtr sheet = Win.Dialogs(pid).FirstOrDefault(IsChooser);
-            if (sheet == Z) { Win.Press(adv, Ids.Databases); sheet = WaitDialog(pid, IsChooser, 10000); }
+            if (sheet == Z) { Need(adv, Ids.Databases, "advanced search window"); Win.Press(adv, Ids.Databases); sheet = WaitDialog(pid, IsChooser, 10000); }
             if (sheet == Z) throw new StuckError("the Responsa database chooser did not open");
             IntPtr page = TreePage(sheet);
             if (page == Z) { Win.Send(sheet, Native.PSM_SETCURSEL, 0, 0); Thread.Sleep(600); page = TreePage(sheet); }
             if (page == Z) throw new StuckError("the 'עץ מקורות' page of the database chooser did not open");
+            foreach (int id in new[] { Ids.DbTree, Ids.DbSelectedView, Ids.DbReset, Ids.DbTitle, Ids.DbOk }) Need(page, id, "database chooser");
             bool done = false;
             try
             {
@@ -390,6 +405,7 @@ namespace ResponsaMcp
             IntPtr r = Win.Dialogs(pid).FirstOrDefault(d => Win.Text(d).Contains("סימון טווח"));
             if (r == Z) { Command(pid, Ids.MarkRange); r = WaitTitle(pid, "סימון טווח", 10000); }
             if (r == Z) throw new StuckError("the Responsa range-marking window did not open");
+            foreach (int id in new[] { Ids.RangeFrom, Ids.RangeTo, Ids.RangeMark, Ids.RangeUnmark, Ids.RangeInvert }) Need(r, id, "range-marking window");
             Win.SetText(Win.Kid(r, Ids.RangeFrom), from.ToString());
             Win.SetText(Win.Kid(r, Ids.RangeTo), to.ToString());
             Win.Click(Win.Kid(r, action));
@@ -423,48 +439,116 @@ namespace ResponsaMcp
             catch (IOException) { return false; }
         }
 
-        static bool IsFileDialog(IntPtr d)
+        /// <summary>IT-827: "Responsa 34.0.0.0", set when the instance starts; named in errors of steps measured on 29.</summary>
+        public static string Version = "Responsa (version unknown)";
+        /// <summary>IT-827: how the last save went (dialog kind, type, method), for `doctor`.</summary>
+        public static string LastSave;
+
+        /// <summary>
+        /// A window that looks like a Save As window that is still being built: an item-dialog view, or an Edit in a
+        /// combo box. It is waited for, never answered like a message box.
+        /// </summary>
+        static bool LooksLikeFileDialog(IntPtr d)
         {
-            foreach (var k in Win.Kids(d)) if (Native.GetDlgCtrlID(k) == 1001 && Win.Class(k) == "Edit" && Win.Class(Native.GetParent(k)).StartsWith("ComboBox")) return true;
-            return false;
+            return Win.Kids(d).Any(k => Win.Class(k) == "DUIViewWndClassName" || (Win.Class(k) == "Edit" && Win.Class(Native.GetParent(k)).StartsWith("ComboBox")));
         }
 
-        /// <summary>Sends a Save command to the active window, fills the Save As dialog with path, waits for the file.</summary>
+        /// <summary>
+        /// Sends a Save command to the active window, fills the Save As window with path, waits for the file there.
+        /// IT-827: a pilot user's Responsa 34 saved to its default name ("respsrch" in its TEMP folder) instead of the
+        /// tool's path. Reproduced with a scratch program's item dialog: after its type changes, the dialog resets the
+        /// name to its default and then saves with that internal name even while the field shows a path put in with
+        /// WM_SETTEXT; a path typed in character by character is taken. So the path is typed first, must stay in the
+        /// field before Save is pressed, and the save counts only if the file appears at the tool's own path; a file
+        /// elsewhere is never read. If Responsa saved elsewhere, the save is tried once more with WM_SETTEXT (the
+        /// method measured on Responsa 29); then it is an error naming the version.
+        /// </summary>
         public static string SaveVia(uint pid, int command, string path)
         {
-            if (File.Exists(path)) File.Delete(path);
-            Command(pid, command);
-            IntPtr sv = Z; var sw = Stopwatch.StartNew();
+            var rounds = new List<string>();
+            for (int round = 0; round < 2; round++)
+            {
+                if (File.Exists(path)) File.Delete(path);
+                Command(pid, command);
+                string r;
+                try { r = FillAndSave(pid, path, round == 0); }
+                finally { rounds.Add(LastSave); LastSave = string.Join("; then ", rounds.ToArray()); }
+                if (r != null) return path;
+            }
+            throw new ToolError(Version + " did not save to the tool's path (it saved under another name, or not at all). " +
+                "Nothing was read. Save As window: " + LastSave + ". Please report this with the output of responsa-mcp.exe doctor.");
+        }
+
+        /// <summary>
+        /// IT-827: the Save As part of SaveVia, for any process `pid` (the offline dialog test drives a scratch program
+        /// with it). Waits for the window, lets it settle, chooses the Unicode type, puts `path` in (typed or not) and
+        /// checks it held, presses Save, and waits. Returns path when the file is at path; null when the window closed
+        /// and no file came to path (Responsa saved elsewhere). Throws ToolError if Responsa refused with a message,
+        /// StuckError if the window was not recognized, did not keep the path, or did not close.
+        /// </summary>
+        public static string FillAndSave(uint pid, string path, bool typed)
+        {
+            LastSave = "no Save As window recognized";
+            IntPtr sv = Z, seen = Z; SaveDialog.Parts parts = null; var sw = Stopwatch.StartNew();
             while (sv == Z && sw.ElapsedMilliseconds < 15000)
             {
                 foreach (var d in Win.Dialogs(pid))
                 {
                     if (IsSearchDialog(d) || IsIyun(d)) continue;
-                    if (IsFileDialog(d)) { sv = d; break; }
+                    parts = SaveDialog.Find(d);
+                    if (parts != null) { sv = d; break; }
+                    if (LooksLikeFileDialog(d)) { seen = d; continue; }   // still being built: wait
                     string msg = Win.DialogMessage(d);
                     if (msg.Length > 0) { Dismiss(d); throw new ToolError("Responsa refused to save: " + msg); }
                 }
-                Thread.Sleep(150);
+                if (sv == Z) Thread.Sleep(150);
             }
-            if (sv == Z) throw new StuckError("the Save As window did not open");
-            IntPtr ed = Win.Kids(sv).First(k => Native.GetDlgCtrlID(k) == 1001 && Win.Class(k) == "Edit");
-            Win.SetText(ed, path);
-            Win.Press(sv, 1);
+            if (sv == Z && seen != Z && Native.IsWindow(seen))
+                throw new StuckError("the Save As window of " + Version + " was not recognized (" + SaveDialog.Describe(seen) + ")");
+            if (sv == Z) throw new StuckError("the Save As window did not open (" + Version + ")");
+
+            SaveDialog.Settle(parts, 500, 4000);
+            string defaultName = Win.Text(parts.Name), typeBefore = parts.Type != Z ? Win.Text(parts.Type) : null;
+            string type = SaveDialog.EnsureUnicode(parts, Version);
+            // Measured: a type change makes the item dialog reset the file name to its default, a moment later.
+            if (type != typeBefore) SaveDialog.Settle(parts, 500, 4000);
+            LastSave = parts.Kind + ", type '" + (type ?? "none") + "', default name '" + defaultName + "', path " + (typed ? "typed" : "set");
+            bool held = SaveDialog.PutName(parts, path, typed, 700);
+            // Typed but not kept (a field that changes typed input): WM_SETTEXT in the same window before giving up.
+            if (!held && typed) { LastSave += " (did not hold), then set"; held = SaveDialog.PutName(parts, path, false, 700); }
+            if (!held)
+                throw new StuckError("the Save As window of " + Version + " did not keep the tool's file name (it shows '" + Win.Text(parts.Name) + "'; " + LastSave + ")");
+            SaveDialog.PressSave(sv, parts);
+
             sw.Restart();
+            double closedAt = -1, boxAt = -1;
             while (sw.ElapsedMilliseconds < 30000)
             {
                 Thread.Sleep(200);
                 foreach (var d in Win.Dialogs(pid))
                 {
                     if (IsSearchDialog(d) || IsIyun(d) || d == sv) continue;
+                    if (SaveDialog.Find(d) != null || LooksLikeFileDialog(d)) continue;
                     string msg = Win.DialogMessage(d);
-                    if (msg.Contains("נשמר") || Win.Text(d) == path) { Dismiss(d); return path; }
+                    if (msg.Contains("נשמר") || Win.Text(d) == path) { Dismiss(d); if (boxAt < 0) boxAt = sw.Elapsed.TotalSeconds; continue; }
                     if (msg.Length > 0) { Dismiss(d); throw new ToolError("Responsa did not save: " + msg); }
                 }
+                bool open = Native.IsWindow(sv) && Native.IsWindowVisible(sv);
+                if (!open && closedAt < 0) closedAt = sw.Elapsed.TotalSeconds;
+                bool here = File.Exists(path) && new FileInfo(path).Length > 0;
+                // Responsa's "הקובץ נשמר" box: the file is written (it is read once Responsa has closed it, SaveParse).
+                if (here && boxAt >= 0) { LastSave += ": saved"; return path; }
                 // IT-789 (found by the live test): Responsa keeps the file open until its "הקובץ נשמר" box is answered,
                 // and that box can come late. Without the box, return only once Responsa has closed the file.
-                if (!Native.IsWindow(sv) && File.Exists(path) && new FileInfo(path).Length > 0 && sw.ElapsedMilliseconds > 2000 && Closed(path)) return path;
+                if (here && !open && sw.ElapsedMilliseconds > 2000 && Closed(path)) { LastSave += ": saved"; return path; }
+                // The window closed (and Responsa said it saved, or said nothing for a while) with no file here: it saved elsewhere.
+                if (!here && !open && ((boxAt >= 0 && sw.Elapsed.TotalSeconds - boxAt > 3) || sw.Elapsed.TotalSeconds - closedAt > 6))
+                {
+                    LastSave += ": no file at the tool's path (" + (boxAt >= 0 ? "Responsa said it saved" : "no message") + ", " + (File.Exists(path) ? "an empty file" : "no file") + ")";
+                    return null;
+                }
             }
+            if (Native.IsWindow(sv) && Native.IsWindowVisible(sv)) throw new StuckError("the Save As window of " + Version + " did not close after Save");
             throw new StuckError("saving did not finish");
         }
 
@@ -486,8 +570,12 @@ namespace ResponsaMcp
             IntPtr page = RefPage(iyun);
             if (page == Z) { Win.Send(iyun, Native.PSM_SETCURSEL, 1, 0); Thread.Sleep(600); page = RefPage(iyun); }
             if (page == Z) throw new StuckError("the 'כתיבת מקורות' page did not open");
-            IntPtr list = Win.Kid(page, Ids.RefList);
-            Win.SetText(Win.Kid(page, Ids.RefEdit), reference);
+            IntPtr list = Need(page, Ids.RefList, "'כתיבת מקורות' page");
+            IntPtr refEdit = Need(page, Ids.RefEdit, "'כתיבת מקורות' page");
+            Need(page, Ids.RefFind, "'כתיבת מקורות' page");
+            Win.SetText(refEdit, reference);
+            // IT-827: read back, so a field that did not take the reference never opens another text.
+            if (Win.Text(refEdit) != reference) throw new StuckError(Version + ": the 'כתיבת מקורות' page did not take the reference");
             Win.Press(page, Ids.RefFind);
             var res = new TextOutcome();
             var sw = Stopwatch.StartNew(); bool shown = false; int lastCount = -1; double stableSince = 0;

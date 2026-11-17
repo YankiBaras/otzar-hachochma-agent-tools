@@ -1,6 +1,6 @@
 ---
 name: responsa
-description: Search and read the Bar-Ilan Responsa Project (פרויקט השו"ת, שו"ת בר אילן) v29 installed on this PC, through the responsa MCP tools (search, get_results, open_text). Use for finding Torah sources, quotes, halachic discussions in responsa, Talmud, Rambam, Shulchan Aruch, commentaries, and for reading a specific source by reference.
+description: Search and read the Bar-Ilan Responsa Project (פרויקט השו"ת, שו"ת בר אילן) installed on this PC (any version; tested on v29), through the responsa MCP tools (search, get_results, open_text). Use for finding Torah sources, quotes, halachic discussions in responsa, Talmud, Rambam, Shulchan Aruch, commentaries, and for reading a specific source by reference.
 ---
 
 # Bar-Ilan Responsa (שו"ת בר אילן) through the `responsa` MCP tools
@@ -104,6 +104,8 @@ Rules:
 ## When something fails
 
 - **"Responsa was not found":** the user must have Responsa installed. Setting `RESPONSA_MCP_EXE` to the full path of `RESPONSA.exe` overrides the search for it.
+- **"did not save to the tool's path"**, **"the Save As window ... was not recognized"** or **"... did not keep the tool's file name"**: this Responsa version's Save As window behaved in a way the tool does not handle. Nothing was read, so no wrong text was returned. Do not retry more than once. Ask the user to run `responsa-mcp.exe doctor` and send its output (its `save_dialog` line says what the Save As window did).
+- **An error naming a control "measured on Responsa 29":** a window of this version differs from Responsa 29. Do not retry; ask the user to report it with the output of `doctor`.
 - **A start-up message about the disk:** the Responsa Disk-on-Key must be connected.
 - **"unknown search_id":** only the last 3 searches are kept, and none survive a restart. Search again.
 - `close_windows` cleans up the private instance if things look stuck.
@@ -114,5 +116,6 @@ Rules:
 
 ## Responsa versions
 
-- The tools were tested on Responsa 29. Other versions are not refused; `status` shows `responsa_version` and `version_tested`. When `version_tested` is false, the query syntax and references above are expected to work, but say so if something behaves unlike this skill.
+- With several Responsa versions installed, the tool uses the newest. `status` lists every install found under `responsa_installs`; the one used has `used: true`.
+- The tools were tested live on Responsa 29. Other versions are expected to work and are not refused; `status` shows `responsa_version` and `version_tested`. When `version_tested` is false, the query syntax and references above are expected to work, but say so if something behaves unlike this skill.
 - `status` also shows `workspace_file`: the workspace autosave the tool protects. The user can run `responsa-mcp.exe doctor` to see the same before anything starts.
