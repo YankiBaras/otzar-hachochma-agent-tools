@@ -80,6 +80,25 @@ namespace ResponsaMcp
             return items;
         }
 
+        /// <summary>
+        /// IT-793: a results save must hold exactly results from..to. Measured on Responsa 29: the "N." of each saved
+        /// result is its real number in the search (marking only 3 saves " 3."; marking 1-3 and 5-6 saves 1,2,3,5,6),
+        /// so the numbers identify the results. Returns null when the numbers are exactly from..to in order, otherwise
+        /// what is wrong (the caller fails; it never returns such a save).
+        /// </summary>
+        public static string CheckRange(IList<ResultItem> items, int from, int to)
+        {
+            int want = to - from + 1;
+            bool ok = items.Count == want;
+            for (int i = 0; ok && i < items.Count; i++) ok = items[i].Number == from + i;
+            if (ok) return null;
+            var nums = new List<string>();
+            for (int i = 0; i < items.Count && i < 12; i++) nums.Add(items[i].Number.ToString());
+            if (items.Count > 12) nums.Add("...");
+            return string.Format("asked for results {0}-{1} ({2}), Responsa saved {3}: {4}", from, to, want, items.Count,
+                items.Count == 0 ? "none" : string.Join(",", nums.ToArray()));
+        }
+
         /// <summary>Text file: source title, a line of '=', the text, and a closing line of '*'.</summary>
         public static string ParseText(string text, out string title)
         {

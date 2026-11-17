@@ -231,9 +231,11 @@ namespace ResponsaMcp
             }
             catch (WindowGone) { searches.Remove(st); throw; }
             finally { Delete(path); }
-            // Responsa numbers the saved (marked) results 1..n; give them their real numbers in the search.
-            int i = from;
-            return items.Select(it => (object)new Dictionary<string, object> { { "n", i++ }, { "source", it.Source }, { "snippet", it.Snippet } }).ToList();
+            // IT-793: the save carries each result's real number. Anything but exactly from..to (marks of an earlier
+            // save left over, a missing result) is never returned; the instance is restarted, which drops every mark.
+            string wrong = SaveParse.CheckRange(items, from, to);
+            if (wrong != null) throw new StuckError("Responsa saved other results than asked (" + wrong + "); nothing was returned, and earlier search_ids are gone");
+            return items.Select(it => (object)new Dictionary<string, object> { { "n", it.Number }, { "source", it.Source }, { "snippet", it.Snippet } }).ToList();
         }
 
         public object GetResults(int searchId, int from, int count)

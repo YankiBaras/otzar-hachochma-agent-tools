@@ -36,7 +36,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 |---|---|
 | `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), the workspace file it protects (`workspace_file`) and open searches. |
 | `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. Optional `books`: search only named books (see below). |
-| `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. |
+| `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. Each result has its real number `n` in the search. If Responsa's save holds anything but exactly the asked results, nothing is returned: the call fails and the instance is restarted (earlier `search_id`s are gone). |
 | `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. |
 | `close_windows` | Closes the result and text windows of the private instance. |
 

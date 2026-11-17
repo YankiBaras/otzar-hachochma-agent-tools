@@ -21,7 +21,7 @@ namespace ResponsaMcp
         // search dialog
         public const int AdvancedType = 1209, AdvQuery = 1233, AllDatabases = 1024, RunSearch = 1;
         // "סימון טווח תוצאות"
-        public const int RangeFrom = 1618, RangeTo = 1619, RangeMark = 1620, RangeUnmark = 1061, RangeOk = 1;
+        public const int RangeFrom = 1618, RangeTo = 1619, RangeMark = 1620, RangeUnmark = 1061, RangeInvert = 1062, RangeOk = 1;
         // "עיון" → "כתיבת מקורות" page
         public const int RefEdit = 1021, RefFind = 1187, RefList = 1617, RefShow = 1;
         // IT-789: search dialog → databases (1210) → "ניהול המאגרים", page "עץ מקורות"
@@ -360,21 +360,60 @@ namespace ResponsaMcp
         }
 
         // ------------------------------------------------------------------ saving
-        /// <summary>Marks results [from..to] of a results window (clearing earlier marks) and saves the marked ones.</summary>
+        /// <summary>
+        /// Marks results [from..to] of a results window (clearing earlier marks) and saves the marked ones.
+        /// IT-793 (measured on Responsa 29): in "סימון טווח תוצאות", "סמן" (1620), "בטל סימון" (1061) and "הפוך סימון"
+        /// (1062) are auto radio buttons; the chosen action is applied to From..To only by "אישור" (1). A WM_COMMAND to a
+        /// radio does not check it, so the old "unmark" press left "סמן" chosen and marks of earlier saves stayed. Unmark
+        /// acts only on its range and marks persist in the window between saves. So: unmark 1..total, then mark from..to,
+        /// each as its own dialog closed by "אישור". Tools.Page then checks the saved file (SaveParse.CheckRange).
+        /// </summary>
         public static string SaveResultRange(uint pid, IntPtr window, int total, int from, int to, string path)
         {
             if (!Owned(pid, window)) throw new WindowGone();
             Activate(pid, window);
-            Command(pid, Ids.MarkRange);
-            IntPtr r = WaitTitle(pid, "סימון טווח", 10000);
-            if (r == Z) throw new StuckError("the Responsa range-marking window did not open");
-            Win.SetText(Win.Kid(r, Ids.RangeFrom), "1"); Win.SetText(Win.Kid(r, Ids.RangeTo), total.ToString());
-            Win.Press(r, Ids.RangeUnmark); Thread.Sleep(400);
-            if (!Native.IsWindow(r)) { Command(pid, Ids.MarkRange); r = WaitTitle(pid, "סימון טווח", 10000); }
-            Win.SetText(Win.Kid(r, Ids.RangeFrom), from.ToString()); Win.SetText(Win.Kid(r, Ids.RangeTo), to.ToString());
-            Win.Press(r, Ids.RangeMark); Thread.Sleep(400);
-            if (Native.IsWindow(r) && Native.IsWindowVisible(r)) { Win.Press(r, Ids.RangeOk); Thread.Sleep(300); }
+            // The dialog and the save act on the active MDI child; never mark or save another search's window.
+            if (Win.Send(MdiClient(pid), Native.WM_MDIGETACTIVE, 0, 0) != window) throw new StuckError("the Responsa results window could not be made active");
+            ApplyRange(pid, 1, total, Ids.RangeUnmark);
+            ApplyRange(pid, from, to, Ids.RangeMark);
+            if (Win.Send(MdiClient(pid), Native.WM_MDIGETACTIVE, 0, 0) != window) throw new StuckError("the Responsa results window is no longer the active one");
             return SaveVia(pid, Ids.SaveAllMarked, path);
+        }
+
+        /// <summary>
+        /// IT-793: one use of "סימון טווח תוצאות": opens it, fills From/To, chooses the action radio by BM_CLICK, reads
+        /// all of it back, and applies it with "אישור". Anything not as set, or a dialog that does not close, is a
+        /// StuckError (the instance is restarted, which drops every mark).
+        /// </summary>
+        static void ApplyRange(uint pid, int from, int to, int action)
+        {
+            IntPtr r = Win.Dialogs(pid).FirstOrDefault(d => Win.Text(d).Contains("סימון טווח"));
+            if (r == Z) { Command(pid, Ids.MarkRange); r = WaitTitle(pid, "סימון טווח", 10000); }
+            if (r == Z) throw new StuckError("the Responsa range-marking window did not open");
+            Win.SetText(Win.Kid(r, Ids.RangeFrom), from.ToString());
+            Win.SetText(Win.Kid(r, Ids.RangeTo), to.ToString());
+            Win.Click(Win.Kid(r, action));
+            int[] radios = { Ids.RangeMark, Ids.RangeUnmark, Ids.RangeInvert };
+            Func<bool> set = () =>
+                Win.Text(Win.Kid(r, Ids.RangeFrom)).Trim() == from.ToString() && Win.Text(Win.Kid(r, Ids.RangeTo)).Trim() == to.ToString()
+                && radios.All(id => (long)Win.Send(Win.Kid(r, id), Native.BM_GETCHECK, 0, 0) == (id == action ? 1 : 0));
+            var sw = Stopwatch.StartNew();
+            while (!set() && sw.ElapsedMilliseconds < 3000) Thread.Sleep(100);
+            if (!set()) throw new StuckError("the Responsa range-marking window did not take the range " + from + "-" + to);
+            Win.Press(r, Ids.RangeOk);
+            sw.Restart();
+            while (Native.IsWindow(r) && Native.IsWindowVisible(r) && sw.ElapsedMilliseconds < 15000) Thread.Sleep(100);
+            if (Native.IsWindow(r) && Native.IsWindowVisible(r)) throw new StuckError("the Responsa range-marking window did not close");
+            foreach (var d in Win.Dialogs(pid))
+            {
+                if (IsSearchDialog(d) || IsIyun(d)) continue;
+                // As in CheckNoMessage: the "הקובץ נשמר" box of an earlier save can come late. Harmless.
+                if (Win.DialogMessage(d).Contains("הקובץ נשמר")) { Dismiss(d); continue; }
+                // Any other message after "אישור" (none was seen when measuring): the marks are unknown.
+                string fatal = FatalText(d);
+                if (fatal != null) throw new FatalDialogError(fatal);
+                throw new StuckError("Responsa showed '" + Win.Text(d) + "': " + Win.DialogMessage(d) + " while marking results");
+            }
         }
 
         /// <summary>True when no process has the file open (it can be opened with no sharing).</summary>

@@ -564,6 +564,40 @@ namespace ResponsaMcp
             string text = SaveParse.ParseText(SaveParse.ReadSaved(Path.Combine(dir, "text.txt")), out title);
             Check(title == "ספר לדוגמה דף ב עמוד א", "text: title");
             Check(text.StartsWith("פסקה ראשונה.") && text.EndsWith("פסקה שנייה."), "text: body without the closing stars");
+            RangeTests();
+        }
+
+        /// <summary>A results save as Responsa writes it, with these result numbers (real numbers, as measured).</summary>
+        static List<ResultItem> Saved(params int[] numbers)
+        {
+            var sb = new StringBuilder("החיפוש : #נר [1:3] #שבת\r\n===================\r\n\r\n");
+            foreach (int n in numbers)
+                sb.Append(string.Format(" {0}.  ספר {0} סימן א\r\nקטע של תוצאה {0}.\r\nשורה שנייה של הקטע.\r\n", n));
+            string q;
+            return SaveParse.ParseResults(sb.ToString(), out q);
+        }
+
+        /// <summary>IT-793: get_results returns a save only if it holds exactly results from..to.</summary>
+        static void RangeTests()
+        {
+            var three = Saved(3);
+            var five = Saved(1, 2, 3, 4, 5);
+            Check(five.Count == 5 && five[4].Number == 5 && five[4].Snippet == "קטע של תוצאה 5. שורה שנייה של הקטע.", "range: synthetic save parses as five results");
+            Check(three.Count == 1 && three[0].Number == 3 && three[0].Source == "ספר 3 סימן א","range: a save of result 3 parses with its real number");
+            Check(SaveParse.CheckRange(three, 3, 3) == null, "range: from 3 count 1, exact save passes");
+            Check(SaveParse.CheckRange(Saved(101, 102), 101, 102) == null, "range: 101-102 exact passes");
+            Check(SaveParse.CheckRange(Saved(1, 2, 3, 4, 5), 1, 5) == null, "range: first page 1-5 passes");
+            // the IT-789 finding: from 3 count 1 after a first page of 5 saved 1-5
+            string leak = SaveParse.CheckRange(Saved(1, 2, 3, 4, 5), 3, 3);
+            Check(leak != null && leak.Contains("3-3") && leak.Contains("1,2,3,4,5"), "range: marks left from an earlier save fail (" + leak + ")");
+            Check(SaveParse.CheckRange(Saved(1, 2, 3, 5, 6), 5, 6) != null, "range: extra results before the range fail");
+            Check(SaveParse.CheckRange(Saved(3, 4, 7), 3, 4) != null, "range: extra result after the range fails");
+            Check(SaveParse.CheckRange(Saved(4, 5), 3, 4) != null, "range: shifted by one fails");
+            Check(SaveParse.CheckRange(Saved(3), 3, 4) != null, "range: a missing result fails");
+            Check(SaveParse.CheckRange(Saved(3, 5), 3, 4) != null, "range: a gap fails even with the right count");
+            Check(SaveParse.CheckRange(Saved(), 1, 1) != null, "range: an empty save fails");
+            var many = SaveParse.CheckRange(Saved(Enumerable.Range(1, 40).ToArray()), 2, 3);
+            Check(many != null && many.Contains("saved 40") && many.EndsWith("..."), "range: long mismatch message is shortened (" + many + ")");
         }
     }
 }
