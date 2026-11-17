@@ -24,6 +24,11 @@ namespace ResponsaMcp
         [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
         [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
         [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
+        // IT-794: DPI awareness of a window and of the calling thread (Windows 10 1607 and later).
+        [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
+        [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
+        [DllImport("user32.dll")] public static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr CreateDesktop(string name, IntPtr dev, IntPtr devmode, uint flags, uint access, IntPtr sa);
@@ -141,6 +146,27 @@ namespace ResponsaMcp
             Native.PostMessage(parent, Native.WM_COMMAND, (IntPtr)(id & 0xFFFF), b);
         }
         public static void Click(IntPtr button) { Native.PostMessage(button, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero); }
+
+        /// <summary>
+        /// IT-794: runs `a` with the calling thread in the DPI awareness of window `h`, then restores the thread's own.
+        /// Measured on Responsa 29 at 125% display scaling: Responsa's windows are system-DPI-aware (120 DPI) and this exe
+        /// is DPI-unaware, so Windows scaled the client point of a posted WM_LBUTTONDOWN/UP by 120/96 on its way to the tree
+        /// (a click on row 5 landed on row 6, rows past 24 fell below the tree). The tree's own messages (TVM_GETITEMRECT,
+        /// TVM_HITTEST) are not scaled. Posted from a thread in the tree's own awareness, the point arrives as sent.
+        /// Without the API (before Windows 10 1607) or for a window without a context, `a` runs unchanged.
+        /// </summary>
+        public static void InDpiOf(IntPtr h, Action a)
+        {
+            IntPtr old = IntPtr.Zero;
+            try
+            {
+                IntPtr ctx = Native.GetWindowDpiAwarenessContext(h);
+                if (ctx != IntPtr.Zero) old = Native.SetThreadDpiAwarenessContext(ctx);
+            }
+            catch (EntryPointNotFoundException) { }
+            try { a(); }
+            finally { if (old != IntPtr.Zero) Native.SetThreadDpiAwarenessContext(old); }
+        }
 
         // ---- cross-process reads (the target is 32-bit, and so is this exe) ----
         const uint PROC_VM = 0x0008 | 0x0010 | 0x0020 | 0x0400;

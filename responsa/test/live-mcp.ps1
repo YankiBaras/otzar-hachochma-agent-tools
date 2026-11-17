@@ -27,14 +27,14 @@ $calls = @(
   @{ jsonrpc = '2.0'; id = 13; method = 'tools/call'; params = @{ name = 'close_windows'; arguments = @{} } },
   # IT-789: books scope. Expect: Daniel only, 3 results incl. 11:41; then an unscoped search restarts the instance
   # (note) and searches all databases again; ambiguous / unknown names are errors with candidates; a commentator path.
-  @{ jsonrpc = '2.0'; id = 14; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#(אדום/עשו)'; books = @('דניאל'); limit = 5 } } },
+  @{ jsonrpc = '2.0'; id = 14; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#(אדום/עשו)'; books = @('דניאל'); limit = 5 } }; scope = @('תנ"ך / דניאל') },
   @{ jsonrpc = '2.0'; id = 140; method = 'tools/call'; params = @{ name = 'get_results'; arguments = @{ search_id = '@14'; from = 3; count = 1 } }; same = @(14, 3) },
   @{ jsonrpc = '2.0'; id = 141; method = 'tools/call'; params = @{ name = 'open_text'; arguments = @{ reference = 'בבלי ברכות ב א'; max_chars = 500 } } },
   @{ jsonrpc = '2.0'; id = 15; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#מקוה [1:3] #טהרה'; all_databases = $false; limit = 1 } } },
   @{ jsonrpc = '2.0'; id = 16; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#(אדום/עשו)'; books = @('רש"י') } } },
   @{ jsonrpc = '2.0'; id = 17; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#(אדום/עשו)'; books = @('ספר שאינו קיים') } } },
   @{ jsonrpc = '2.0'; id = 18; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#(אדום/עשו)'; books = @('דניאל'); all_databases = $true } } },
-  @{ jsonrpc = '2.0'; id = 19; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#מלך'; books = @('רש"י ומפרשיו / רש"י / דניאל', 'מצודת דוד', 'אסתר'); limit = 2 } } },
+  @{ jsonrpc = '2.0'; id = 19; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#מלך'; books = @('רש"י ומפרשיו / רש"י / דניאל', 'מצודת דוד', 'אסתר'); limit = 2 } }; scope = @('תנ"ך / אסתר', 'מפרשי תנ"ך / רש"י ומפרשיו / רש"י / דניאל', 'מפרשי תנ"ך / מפרשי תנ"ך / מצודת דוד') },
   @{ jsonrpc = '2.0'; id = 20; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#מקוה [1:3] #טהרה'; all_databases = $true; limit = 1 } } },
   @{ jsonrpc = '2.0'; id = 21; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = '#מקוה [1:3] #טהרה'; limit = 1 } } }
 )
@@ -49,6 +49,7 @@ function Assert($cond, $what) {
 }
 foreach ($c in $calls) {
   $same = $c.same; $c.Remove('same')
+  $scope = $c.scope; $c.Remove('scope')   # IT-794: a books search must succeed with exactly this read-back
   $sid = if ($c.params.arguments) { $c.params.arguments.search_id } else { $null }
   if ($sid -is [string] -and $sid.StartsWith('@')) {
     $from = [int]$sid.Substring(1)
@@ -65,9 +66,10 @@ foreach ($c in $calls) {
   $name = $c.params.name
   if ($name -ne 'search' -and $name -ne 'get_results') { continue }
   $r = $resp | ConvertFrom-Json
-  if ($r.result.isError) { if ($name -eq 'get_results' -or $same) { Assert $false "[$($c.id)] returned an error" }; continue }
+  if ($r.result.isError) { if ($name -eq 'get_results' -or $same -or $scope) { Assert $false "[$($c.id)] returned an error" }; continue }
   $body = $r.result.content[0].text | ConvertFrom-Json
   $replies[$c.id] = $body
+  if ($scope) { Assert ((@($body.scope) -join ' | ') -eq ($scope -join ' | ')) "[$($c.id)] scope is $($scope -join ' | '): $(@($body.scope) -join ' | ')" }
   $ns = @(@($body.results) | Where-Object { $_ } | ForEach-Object { [int]$_.n })
   if ($name -eq 'search') {
     if ($ns.Count -gt 0) { Assert (($ns -join ',') -eq ((1..$ns.Count) -join ',')) "[$($c.id)] search numbered 1..$($ns.Count): $($ns -join ',')" }

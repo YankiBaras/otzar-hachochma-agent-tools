@@ -4,6 +4,8 @@
 //   * "התחל שוב" (1136) clears the selection and rebuilds the tree collapsed.
 //   * A left click on a node toggles it. The tree takes the click position from the message, so a click posted to the
 //     tool's own hidden tree (no real input) toggles exactly the node under that position.
+//   * IT-794: that position must be posted in the tree's DPI awareness (Win.InDpiOf). Responsa's windows are
+//     system-DPI-aware; from a DPI-unaware thread Windows scales a posted click point by the display scaling.
 //   * " רשימת המאגרים שנבחרו" (1199) switches the tree to a view of the selected nodes only: a fully selected node
 //     appears without children, a partly selected one with its selected children. This is how the tool reads back
 //     what was selected.
@@ -281,8 +283,12 @@ namespace ResponsaMcp
                 if (now != last) { last = now; continue; }
                 if (HitTest(x, y) != item) { last = null; continue; }
                 IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
-                Native.PostMessage(tv, 0x0201 /*WM_LBUTTONDOWN*/, (IntPtr)1, lp);
-                Native.PostMessage(tv, 0x0202 /*WM_LBUTTONUP*/, IntPtr.Zero, lp);
+                // IT-794: posted in the tree's DPI awareness, so Windows does not scale the point (see Win.InDpiOf).
+                Win.InDpiOf(tv, delegate
+                {
+                    Native.PostMessage(tv, 0x0201 /*WM_LBUTTONDOWN*/, (IntPtr)1, lp);
+                    Native.PostMessage(tv, 0x0202 /*WM_LBUTTONUP*/, IntPtr.Zero, lp);
+                });
                 return;
             }
             throw new StuckError("a node of Responsa's database tree did not stay in place to be selected");

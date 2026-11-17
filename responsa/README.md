@@ -48,6 +48,7 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
   - No match, or two matches at the same level: an error with the candidates (as paths). Nothing is searched.
   - One match higher in the tree than the others (e.g. `בראשית` the book and the `בראשית` parts of Hasidic books): that one is taken and `books_note` names the others.
 - **Selecting.** The tool opens its instance's database chooser and presses "התחל שוב" (clear). It then posts a click to each named node of its own hidden tree. Each node is verified: its icon turns green (image 0).
+  - The click is posted in the tree's own DPI awareness (IT-794). Responsa's windows are system-DPI-aware; posted from the DPI-unaware tool, Windows scaled the click point with the display scaling (at 125% a click landed one or more rows lower, or below the tree).
   - It reads the result back from Responsa's own "רשימת המאגרים שנבחרו" view. The search runs only if that view shows exactly the named nodes; otherwise the instance is restarted and an error is returned. The search never runs wider than asked.
   - The reply's `scope` is that read-back.
 - **Afterwards.** The selection lives only in the tool's instance's memory. Measured on Responsa 29: confirming it writes nothing to the data folder, and the instance is never closed normally, so it is never saved. The user's own selection on disk is untouched.

@@ -30,11 +30,43 @@ namespace ResponsaMcp
             WorkspaceGuardTests();
             WorkspaceFileTests();
             BookTests();
+            DpiTests();
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
             Check(Ui.FixBidi("תלמוד בבלי") == "תלמוד בבלי", "FixBidi plain");
             Check(McpServer.Serialize(new Dictionary<string, object> { { "t", "גמ' <a> & b" } }) == "{\"t\":\"גמ' <a> & b\"}", "Serialize keeps ' < > & plain");
             Console.WriteLine(string.Format("{0} passed, {1} failed", passed, failed));
             return failed == 0 ? 0 : 1;
+        }
+
+        // ---- IT-794: a click is posted in the target window's DPI awareness, and the thread's own is restored after
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern IntPtr CreateWindowEx(int ex, string cls, string name, int style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr p);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+        static void DpiTests()
+        {
+            IntPtr unaware = (IntPtr)(-1), system = (IntPtr)(-2);
+            IntPtr own;
+            try { own = Native.GetThreadDpiAwarenessContext(); }
+            catch (EntryPointNotFoundException) { Console.WriteLine("DPI tests skipped: no DPI awareness API on this Windows"); return; }
+            Check(Native.AreDpiAwarenessContextsEqual(own, unaware), "the tool's thread is DPI-unaware (as when the scaling was measured)");
+            // A window of this thread created as system-DPI-aware, like Responsa's windows.
+            IntPtr prev = Native.SetThreadDpiAwarenessContext(system);
+            IntPtr w = CreateWindowEx(0, "STATIC", "dpi", 0, 0, 0, 10, 10, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            Native.SetThreadDpiAwarenessContext(prev);
+            try
+            {
+                Check(w != IntPtr.Zero && Native.AreDpiAwarenessContextsEqual(Native.GetWindowDpiAwarenessContext(w), system), "test window is system-DPI-aware");
+                bool inside = false;
+                Win.InDpiOf(w, delegate { inside = Native.AreDpiAwarenessContextsEqual(Native.GetThreadDpiAwarenessContext(), system); });
+                Check(inside, "InDpiOf runs in the window's DPI awareness");
+                Check(Native.AreDpiAwarenessContextsEqual(Native.GetThreadDpiAwarenessContext(), unaware), "InDpiOf restores the thread's awareness");
+                try { Win.InDpiOf(w, delegate { throw new InvalidOperationException("x"); }); } catch (InvalidOperationException) { }
+                Check(Native.AreDpiAwarenessContextsEqual(Native.GetThreadDpiAwarenessContext(), unaware), "InDpiOf restores the awareness after an exception");
+                bool ran = false;
+                Win.InDpiOf(IntPtr.Zero, delegate { ran = Native.AreDpiAwarenessContextsEqual(Native.GetThreadDpiAwarenessContext(), unaware); });
+                Check(ran, "InDpiOf on no window runs unchanged");
+            }
+            finally { if (w != IntPtr.Zero) DestroyWindow(w); }
         }
 
         static Dictionary<string, object> Schema()
