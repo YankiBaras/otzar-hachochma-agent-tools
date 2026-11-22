@@ -47,6 +47,7 @@ namespace ResponsaMcp
         [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+        public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;   // IT-868
         [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
         [DllImport("kernel32.dll")] public static extern bool TerminateProcess(IntPtr h, uint code);
         [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
@@ -65,7 +66,7 @@ namespace ResponsaMcp
         public const uint WM_SETTEXT = 0x0C, WM_GETTEXT = 0x0D, WM_GETTEXTLENGTH = 0x0E, WM_CLOSE = 0x10, WM_COMMAND = 0x111;
         public const uint BM_GETCHECK = 0xF0, BM_SETCHECK = 0xF1, BM_CLICK = 0xF5;
         public const uint WM_MDIACTIVATE = 0x222, WM_MDIGETACTIVE = 0x229;
-        public const uint LB_GETCOUNT = 0x18B, LB_GETCURSEL = 0x188, LB_SETCURSEL = 0x186;
+        public const uint LB_GETCOUNT = 0x18B, LB_GETCURSEL = 0x188, LB_SETCURSEL = 0x186, LB_GETTEXT = 0x189, LB_GETTEXTLEN = 0x18A;
         public const uint LVM_GETITEMCOUNT = 0x1004, LVM_GETITEMTEXTW = 0x1073;
         public const uint PSM_SETCURSEL = 0x465;
         const uint SMTO_ABORTIFHUNG = 0x0002;
@@ -89,6 +90,16 @@ namespace ResponsaMcp
             var sb = new StringBuilder(len + 2); IntPtr r;
             Native.SendMessageTimeout(h, Native.WM_GETTEXT, (IntPtr)(len + 1), sb, 0x0002, 2000, out r);
             return sb.ToString();
+        }
+        /// <summary>IT-868: the text of list box item i ("" if it has none or cannot be read; the system marshals LB_GETTEXT).</summary>
+        public static string ListBoxItem(IntPtr lb, int i)
+        {
+            IntPtr n; Native.SendMessageTimeout(lb, Native.LB_GETTEXTLEN, (IntPtr)i, IntPtr.Zero, 0x0002, 2000, out n);
+            int len = (int)n;
+            if (len <= 0 || len > 4000) return "";
+            var sb = new StringBuilder(len + 2); IntPtr r;
+            Native.SendMessageTimeout(lb, Native.LB_GETTEXT, (IntPtr)i, sb, 0x0002, 2000, out r);
+            return (int)r > 0 ? sb.ToString().Trim() : "";
         }
         public static void SetText(IntPtr h, string s) { IntPtr r; Native.SendMessageTimeout(h, Native.WM_SETTEXT, IntPtr.Zero, s, 0x0002, 5000, out r); }
         public static string Class(IntPtr h) { var sb = new StringBuilder(256); Native.GetClassName(h, sb, 256); return sb.ToString(); }

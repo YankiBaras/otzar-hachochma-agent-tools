@@ -385,7 +385,8 @@ namespace ResponsaMcp
                     // "Loading. Please wait..." and other transient windows: wait.
                     if (!mainReady || sw.Elapsed.TotalSeconds - mainReadyAt < 5) continue;
                     // Still there 5 s after the main window is ready: a start-up message (e.g. the Responsa disk is missing).
-                    return "Responsa shows a message at start-up: '" + t + "' " + Win.DialogMessage(d);
+                    string m = Win.DialogMessage(d), hint = ResponsaEnv.Hint(t + " " + m);   // IT-868: error 15
+                    return "Responsa shows a message at start-up: '" + t + "' " + m + (hint != null ? " " + hint : "");
                 }
                 if (mainReady && sw.Elapsed.TotalSeconds > 3 && Win.Dialogs(Pid).Count == 0)
                 {

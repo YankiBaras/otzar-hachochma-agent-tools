@@ -32,11 +32,80 @@ namespace ResponsaMcp
             InstallTests();
             BookTests();
             DpiTests();
+            EnvTests();        // IT-868
+            DistanceTests();   // IT-868
+            SourceTests();     // IT-868
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
             Check(Ui.FixBidi("תלמוד בבלי") == "תלמוד בבלי", "FixBidi plain");
             Check(McpServer.Serialize(new Dictionary<string, object> { { "t", "גמ' <a> & b" } }) == "{\"t\":\"גמ' <a> & b\"}", "Serialize keeps ' < > & plain");
             Console.WriteLine(string.Format("{0} passed, {1} failed", passed, failed));
             return failed == 0 ? 0 : 1;
+        }
+
+        // ---- IT-868: the environment RESPONSA.exe is started with
+        static Dictionary<string, string> D(params string[] kv)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < kv.Length; i += 2) d[kv[i]] = kv[i + 1];
+            return d;
+        }
+        static void EnvTests()
+        {
+            // What Claude Desktop passes (measured), and the user's default environment.
+            var reduced = D("APPDATA", @"C:\U\a", "PATH", @"C:\client", "TEMP", @"C:\U\Temp", "SYSTEMROOT", @"C:\Windows", "RESPONSA_MCP_EXE", @"C:\R\RESPONSA.exe");
+            var user = D("TMP", @"C:\U\Temp", "TEMP", @"C:\other", "windir", @"C:\Windows", "Path", @"C:\user;C:\sys", "ProgramData", @"C:\ProgramData", "=C:", @"C:\");
+            var e = ResponsaEnv.Complete(reduced, user, @"C:\gtp\");
+            Check(e.Vars["TMP"] == @"C:\U\Temp" && e.Added.Contains("TMP"), "env: TMP comes from the user's default environment");
+            Check(e.Vars["PATH"] == @"C:\client" && e.Vars["TEMP"] == @"C:\U\Temp", "env: the client's PATH and TEMP are not changed (names compared without case)");
+            Check(e.Vars["RESPONSA_MCP_EXE"] == @"C:\R\RESPONSA.exe", "env: a variable only the client set stays");
+            Check(e.Vars.ContainsKey("windir") && e.Vars.ContainsKey("ProgramData") && !e.Vars.ContainsKey("=C:"), "env: missing variables added, '=' entries not");
+            Check(string.Join(",", e.Added.ToArray()) == "ProgramData,TMP,windir", "env: added names listed, sorted: " + string.Join(",", e.Added.ToArray()));
+            Check(e.Report().StartsWith("TMP was missing"), "env: report says TMP was missing: " + e.Report());
+            var own = ResponsaEnv.Complete(D("PATH", "x", "TMP", "t"), D("MY_SECRET_PASS", "1", "ComSpec", "c"), null);
+            Check(own.Report().Contains("2 variable(s)") && own.Report().Contains("ComSpec") && !own.Report().Contains("MY_SECRET"), "env: report names only well-known variables: " + own.Report());
+            var noDef = ResponsaEnv.Complete(reduced, null, @"C:\gtp\");
+            Check(noDef.Vars["TMP"] == @"C:\U\Temp" && noDef.Added.Count == 1, "env: no default environment: TMP from TEMP");
+            var noTemp = ResponsaEnv.Complete(D("PATH", "x"), null, @"C:\gtp\");
+            Check(noTemp.Vars["TMP"] == @"C:\gtp", "env: no TEMP either: the system temp path");
+            var emptyTmp = ResponsaEnv.Complete(D("TMP", " ", "TEMP", @"C:\t"), null, null);
+            Check(emptyTmp.Vars["TMP"] == @"C:\t" && emptyTmp.Added.Contains("TMP"), "env: an empty TMP is replaced");
+            var full = ResponsaEnv.Complete(D("TMP", @"C:\mine", "TEMP", @"C:\t", "windir", "w"), D("TMP", @"C:\U\Temp", "windir", "x"), null);
+            Check(full.Added.Count == 0 && full.Vars["TMP"] == @"C:\mine" && full.Report().StartsWith("complete"), "env: full environment: nothing added, nothing changed");
+            string block = ResponsaEnv.Block(D("b", "2", "A", "1", "c", "x=y"));
+            Check(block == "A=1\0b=2\0c=x=y\0\0", "env: block sorted without case, ends with two NULs");
+            var parsed = ResponsaEnv.Parse("=C:=C:\\x\0A=1\0b=x=y\0\0");
+            Check(parsed.Count == 3 && parsed["=C:"] == "C:\\x" && parsed["B"] == "x=y", "env: Parse keeps '=' names and values with '='");
+            Check(ResponsaEnv.Parse("\0").Count == 0 && ResponsaEnv.Parse("=\0x\0").Count == 0, "env: Parse skips short entries");
+            Check(ResponsaEnv.Get().Vars.ContainsKey("TMP") && ResponsaEnv.Get().DefaultError == null, "env: this process's completed environment has TMP, default environment read: " + ResponsaEnv.Get().Report());
+            Check(ResponsaEnv.Hint("אזהרה: שגיאה מס' 15: לא ניתן לפתוח את הקובץ.") != null && ResponsaEnv.Hint("תקלה: שגיאה מס' 9: בעיית קלט/פלט") == null
+                && ResponsaEnv.Hint("שגיאה מס' 150") == null, "env: hint only for error 15");
+        }
+
+        // ---- IT-868: distance order differs between versions
+        static void DistanceTests()
+        {
+            Check(Distance.Swap("נר [1:3] שבת") == "נר [3:1] שבת", "distance: [1:3] -> [3:1]");
+            Check(Distance.Swap("#א [1:2] #ב [ 0 : 5 ] ג") == "#א [2:1] #ב [5:0] ג", "distance: every range, spaces allowed");
+            Check(Distance.Swap("א [-5:5] ב") == "א [5:-5] ב", "distance: negative part kept with its number");
+            Check(Distance.Swap("א [3] ב 5: %קדש") == "א [3] ב 5: %קדש", "distance: one-number range and other colons unchanged");
+            Check(Distance.Swap(Distance.Swap("x [1:3] y [2:4]")) == "x [1:3] y [2:4]", "distance: swap twice is the query");
+            Check(Distance.IsOrderError(new List<string> { "שגיאה בהגדרת השאילתה: המרחק המקסימלי קטן מהמרחק המינימלי." }), "distance: Responsa's message recognized");
+            Check(!Distance.IsOrderError(new List<string> { "לא נמצאה כל תוצאה!" }) && !Distance.IsOrderError(null), "distance: other messages not");
+        }
+
+        // ---- IT-868: open_text's source is never empty
+        static void SourceTests()
+        {
+            var names = new List<string> { "שולחן ערוך אורח חיים סימן רסג", "", "טור אורח חיים סימן רסג" };
+            var a = Tools.SourceFields("", "או\"ח סי' רסג", "שולחן ערוך אורח חיים סימן רסג", 4, names);
+            Check((string)a["source"] == "שולחן ערוך אורח חיים סימן רסג" && a.ContainsKey("source_from") && (string)a["source_short"] == "או\"ח סי' רסג", "source: empty title -> the item opened from the list");
+            Check(((List<object>)a["candidates"]).Count == 2 && (string)a["opened"] == "שולחן ערוך אורח חיים סימן רסג" && ((string)a["note"]).Contains("first 2"), "source: candidates listed, opened named");
+            var b = Tools.SourceFields(" ", "או\"ח סי' רסג", null, 4, new List<string>());
+            Check((string)b["source"] == "או\"ח סי' רסג" && !b.ContainsKey("source_short") && !b.ContainsKey("candidates"), "source: no title, no list -> the saved title line");
+            var c = Tools.SourceFields("בבלי ברכות ב א", "ברכות ב א", null, 0, null);
+            Check((string)c["source"] == "בבלי ברכות ב א" && !c.ContainsKey("source_from") && !c.ContainsKey("note"), "source: window title used as before");
+            var d = Tools.SourceFields(null, null, null, 0, null);
+            Check(((string)d["source"]).Length > 0, "source: never empty");
         }
 
         // ---- IT-794: a click is posted in the target window's DPI awareness, and the thread's own is restored after

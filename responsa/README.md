@@ -26,7 +26,7 @@ Lets an AI agent (Claude Code, Claude Desktop, or any MCP client) search and rea
      { "mcpServers": { "responsa": { "command": "C:\\Users\\<you>\\AppData\\Local\\ResponsaMcp\\bin\\responsa-mcp.exe" } } }
      ```
 4. Install the skill: copy `skill\responsa` to `%USERPROFILE%\.claude\skills\`, or upload it as a skill in Claude.
-5. Check: `responsa-mcp.exe doctor` first prints the Responsa version, the workspace file it found and every Responsa install found (`install:`). It then starts the private instance, runs a control search, opens one text, prints how the Save As window went (`save_dialog:`) and stops. It takes about 15 seconds. When something fails on your Responsa version, send this output.
+5. Check: `responsa-mcp.exe doctor` first prints the Responsa version, the workspace file it found, every Responsa install found and the environment Responsa will get (`install:`). It then starts the private instance, runs a control search, opens one text, prints how the Save As window went (`save_dialog:`) and stops. It takes about 15 seconds. When something fails on your Responsa version, send this output.
 
 The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs Responsa.
 
@@ -34,10 +34,10 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 
 | Tool | Does |
 |---|---|
-| `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), every install found (`responsa_installs`, the one used marked), the workspace file it protects (`workspace_file`) and open searches. |
+| `status` | Starts the private instance if needed; reports install, version (`responsa_version`, `version_tested`), every install found (`responsa_installs`, the one used marked), the workspace file it protects (`workspace_file`), whether Responsa's environment had to be completed (`environment`) and open searches. |
 | `search` | Advanced-syntax query. Returns the total, results per database, and the first results (source line + snippet), up to 50. Optional `books`: search only named books (see below). |
 | `get_results` | Another page of a search (≤ 50). The last 3 searches are kept. Each result has its real number `n` in the search. If Responsa's save holds anything but exactly the asked results, nothing is returned: the call fails and the instance is restarted (earlier `search_id`s are gone). |
-| `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. |
+| `open_text` | One unit of text by reference (`בבלי ברכות כז ב`, `שוע אוח רסג`), up to 60,000 characters. `source` is never empty. When several sources match, `candidates` (first 20) and `opened` name them. |
 | `close_windows` | Closes the result and text windows of the private instance. |
 
 ## Searching only some books (IT-789)
@@ -94,6 +94,16 @@ The Responsa disk (Disk-on-Key) must be connected, exactly as when the user runs
 - **Report problems with the output of `responsa-mcp.exe doctor`.** Where a window of another version differs from Responsa 29 (a control the tool measured on 29 is missing, the Save As window is not recognized, or Responsa saves elsewhere), the tool returns an error that names the version and the step. It never returns a raw exception or text from another file.
 - **Several versions installed:** the tool collects every install it finds (the uninstall registry and `Program Files\Responsa*`) and uses the newest by file version. Its data folder (`Responsa.env`) and workspace file are those of that install. `status` and `doctor` list every install found under `responsa_installs`, with the one used marked `used: true`.
   - `RESPONSA_MCP_EXE` still overrides the choice. If it is set to a path that does not exist, the tool says so instead of falling back to another install.
+- **Distance order (IT-868):** Responsa 29 and 34 read `[a:b]` as min:max; Responsa 31 (measured by a pilot) as max:min and rejects `[1:3]` with "המרחק המקסימלי קטן מהמרחק המינימלי". On that message `search` swaps the two numbers of every `[a:b]` and runs the query once more, and says so in `ran_as` and `distance_note`. `doctor`'s control search goes through the same retry.
+
+### The environment Responsa is started with (IT-868)
+
+Responsa needs the `TMP` variable and does not fall back to `TEMP`. MCP clients start servers with a reduced environment; Claude Desktop passes no `TMP`. Measured on Responsa 29: with only that environment a search fails with "שגיאה מס' 15: לא ניתן לפתוח את הקובץ" and "שגיאה מס' 9: בעיית קלט/פלט"; a Responsa 31 pilot got error 15 already at start-up. From cmd everything works, because the full environment is there.
+
+- The tool starts its `RESPONSA.exe` with its own environment, plus every variable of the user's default environment (`CreateEnvironmentBlock`, what a new logon of this user gets) that the client did not pass. If `TMP` is still missing or empty, it is set from `TEMP` or the system temp path.
+- A variable the client set is never removed or changed (`PATH`, `RESPONSA_MCP_EXE`, ...). Nothing of the user's own environment or registry is written.
+- `status` and `doctor` show `environment`: "complete", or that `TMP` was missing and how many variables were added. Only well-known Windows names are listed; the user's own variables are counted, never named.
+- If Responsa still reports error 15, the result carries a `hint` with the `TMP` it got and what to check, and `doctor` ends with `ERROR`.
 
 ### The Save As window (IT-827)
 

@@ -67,9 +67,12 @@ namespace ResponsaMcp
             {
                 o.WriteLine("install: " + McpServer.Serialize(Tools.Installation()));   // IT-785: before the instance starts
                 o.WriteLine("status: " + McpServer.Serialize(tools.Status()));
-                o.WriteLine("search: " + McpServer.Serialize(tools.Search(query, 1, null, 3, 180)));
+                var search = tools.Search(query, 1, null, 3, 180) as Dictionary<string, object>;
+                o.WriteLine("search: " + McpServer.Serialize(search));
                 o.WriteLine("open_text: " + Trim(McpServer.Serialize(tools.OpenText("בבלי ברכות ב א", 600, 30))));
                 o.WriteLine("save_dialog: " + Ui.LastSave);   // IT-827: which Save As window this version showed
+                // IT-868: Responsa's error 15 in the control search is a failure, not a pass with 0 results
+                if (search != null && search.ContainsKey("hint")) { o.WriteLine("ERROR: " + search["hint"]); return 1; }
                 return 0;
             }
             catch (ToolError e) { o.WriteLine("ERROR: " + e.Message); o.WriteLine("save_dialog: " + Ui.LastSave); return 1; }

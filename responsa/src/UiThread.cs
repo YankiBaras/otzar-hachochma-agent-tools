@@ -90,8 +90,14 @@ namespace ResponsaMcp
             si.cb = Marshal.SizeOf(si);
             si.lpDesktop = "WinSta0\\" + desktopName;
             Native.PROCESS_INFORMATION pi;
-            if (!Native.CreateProcess(exe, "\"" + exe + "\"", IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, workDir, ref si, out pi))
-                throw new ToolError("cannot start Responsa (error " + Marshal.GetLastWin32Error() + ")");
+            // IT-868: a complete environment (TMP above all), whatever the MCP client passed. See ResponsaEnv.
+            IntPtr env = Marshal.StringToHGlobalUni(ResponsaEnv.Block(ResponsaEnv.Get().Vars));
+            try
+            {
+                if (!Native.CreateProcess(exe, "\"" + exe + "\"", IntPtr.Zero, IntPtr.Zero, false, Native.CREATE_UNICODE_ENVIRONMENT, env, workDir, ref si, out pi))
+                    throw new ToolError("cannot start Responsa (error " + Marshal.GetLastWin32Error() + ")");
+            }
+            finally { Marshal.FreeHGlobal(env); }
             Native.CloseHandle(pi.hThread);
             pid = pi.dwProcessId;
             return pi.hProcess;

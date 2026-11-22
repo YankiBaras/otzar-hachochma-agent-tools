@@ -553,7 +553,13 @@ namespace ResponsaMcp
         }
 
         // ------------------------------------------------------------------ open text by reference
-        public sealed class TextOutcome { public IntPtr Window; public string Title; public int Candidates; }
+        public sealed class TextOutcome
+        {
+            public IntPtr Window; public string Title; public int Candidates;
+            public List<string> Names = new List<string>();   // IT-868: the choice list's items (at most MaxNames), when several matched
+            public string Chosen;                              // IT-868: the item that was opened, as the list shows it
+        }
+        const int MaxNames = 20;
 
         static IntPtr RefPage(IntPtr iyun)
         {
@@ -583,7 +589,16 @@ namespace ResponsaMcp
             {
                 Thread.Sleep(250);
                 var nw = MdiChildren(pid).Where(h => !before.Contains(h.ToInt64())).ToList();
-                if (nw.Count > 0) { Thread.Sleep(800); res.Window = nw[0]; res.Title = Win.Text(nw[0]); return res; }
+                if (nw.Count > 0)
+                {
+                    // IT-868: a Responsa 34 pilot got an empty title after a choice from the list (on 29 it was filled at
+                    // once). The window's caption can come late, so it is read again for up to 4 s before giving up.
+                    Thread.Sleep(800);
+                    res.Window = nw[0]; res.Title = Win.Text(nw[0]).Trim();
+                    var tw = Stopwatch.StartNew();
+                    while (res.Title.Length == 0 && tw.ElapsedMilliseconds < 4000 && Native.IsWindow(nw[0])) { Thread.Sleep(200); res.Title = Win.Text(nw[0]).Trim(); }
+                    return res;
+                }
                 foreach (var d in Win.Dialogs(pid))
                 {
                     if (IsSearchDialog(d) || IsIyun(d)) continue;
@@ -597,6 +612,10 @@ namespace ResponsaMcp
                 {
                     res.Candidates = count;
                     if ((int)Win.Send(list, Native.LB_GETCURSEL, 0, 0) < 0) Win.Send(list, Native.LB_SETCURSEL, 0, 0);
+                    // IT-868: what was found and what is opened, so a missing title never leaves the agent guessing
+                    for (int i = 0; i < Math.Min(count, MaxNames); i++) res.Names.Add(Win.ListBoxItem(list, i));
+                    int sel = (int)Win.Send(list, Native.LB_GETCURSEL, 0, 0);
+                    res.Chosen = Win.ListBoxItem(list, sel < 0 ? 0 : sel);
                     Win.Press(page, Ids.RefShow);
                     shown = true;
                 }

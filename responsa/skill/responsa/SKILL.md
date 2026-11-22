@@ -36,7 +36,7 @@ Type the query in logical order, the way it is read. Rows marked **(checked)** w
 | alternatives | `(משה/אהרן)` | slash, inside parentheses; operators inside or outside: `#(בית/אפטרופ)*` (checked) |
 | multi-word alternative | `({{צער בעלי חיים}}/{{צעב"ח}})` | without `{{}}` you get "מילה יכולה להכיל אותיות עבריות וספרות בלבד" (the error is checked) |
 | exclude (one component per query) | `יום -(כיפור/הכיפורים)` | (checked, with `[-5:5]`) |
-| distance: 2nd word 1..3 words after 1st | `נר [1:3] שבת` | **min:max**. `[3:1]` is an error (checked) |
+| distance: 2nd word 1..3 words after 1st | `נר [1:3] שבת` | write **min:max**. Responsa 31 wants max:min; the tool retries swapped by itself (see below) |
 | either order | `#בה"מ [-5:5] #שבת` | negative min allows the 2nd word before the 1st (checked) |
 | every adjacent pair within N, any order | `5: %קדש #שם` | **number then colon**; `:5 ...` fails (checked) |
 | same sentence / paragraph / document | `משפט: $מנהג $שבת #ביהכ"נ` | also `פסקה:` and `מסמך:` (`משפט:` checked) |
@@ -52,6 +52,7 @@ Tips:
 - Hebrew/Aramaic endings (ה/א, ם/ן) have no symbol: use alternatives, e.g. `(מדליקים/מדליקין)`.
 - God's name is stored as `יקוק`.
 - Responsa echoes queries mirrored (`נר ]1:3[ שבת`); that is display only.
+- **Distance order differs between versions.** Responsa 29 and 34 read `[a:b]` as min:max, Responsa 31 as max:min. Write min:max. When Responsa rejects the query with "המרחק המקסימלי קטן מהמרחק המינימלי", the tool swaps the two numbers in every `[a:b]` and searches once more. The result then has `ran_as` (the query as run) and `distance_note`. A negative range swaps the same way (`[-5:5]` runs as `[5:-5]`). Do not swap yourself.
 
 Errors come back in `responsa_messages`, verbatim in Hebrew:
 - "שגיאה בהגדרת השאילתה: ..." means the syntax is wrong. Fix it and search again.
@@ -94,7 +95,7 @@ Write references the way Responsa's "כתיבת מקורות" accepts them:
 
 Rules:
 - Never write `פ"א` for chapter 1: it is read as 81. Write `א` or `פרק א`.
-- Ambiguous references open Responsa's first choice. The result then has a `note`, and `source` says what was actually opened. Make the reference more specific (`בבלי`, `מסכת`, `דף`) if it is not what you wanted.
+- Ambiguous references open Responsa's first choice. The result then has a `note`, `opened` (the item opened) and `candidates` (Responsa's list, first 20). `source` says what was actually opened; it is never empty (`source_from` says when it was taken from the list or the text's title line). Make the reference more specific (`בבלי`, `מסכת`, `דף`), or use one of `candidates`, if it is not what you wanted.
 - Shulchan Aruch text includes the commentary reference letters, e.g. `(א') א (א)`. These are not part of the text.
 - Text markers:
   - `=...=` explains an abbreviation.
@@ -107,6 +108,7 @@ Rules:
 - **"did not save to the tool's path"**, **"the Save As window ... was not recognized"** or **"... did not keep the tool's file name"**: this Responsa version's Save As window behaved in a way the tool does not handle. Nothing was read, so no wrong text was returned. Do not retry more than once. Ask the user to run `responsa-mcp.exe doctor` and send its output (its `save_dialog` line says what the Save As window did).
 - **An error naming a control "measured on Responsa 29":** a window of this version differs from Responsa 29. Do not retry; ask the user to report it with the output of `doctor`.
 - **A start-up message about the disk:** the Responsa Disk-on-Key must be connected.
+- **"שגיאה מס' 15: לא ניתן לפתוח את הקובץ" (error 15), with a `hint`:** Responsa could not open a file. Seen when Responsa had no `TMP` variable (Claude Desktop does not pass it); the tool now completes the environment itself (`environment` in `status`). Do not retry more than once. Tell the user the `hint`: check the temp folder it names and the Responsa disk, and send the output of `responsa-mcp.exe doctor`.
 - **"unknown search_id":** only the last 3 searches are kept, and none survive a restart. Search again.
 - `close_windows` cleans up the private instance if things look stuck.
 - **Automatic restart.** If an operation gets stuck (a search that does not finish within `timeout_sec`, a window that does not open), or Responsa shows an internal error or an unknown window, the tool restarts its private instance at once. The error message then ends with "The private Responsa instance was restarted; try again."

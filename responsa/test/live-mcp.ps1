@@ -20,7 +20,7 @@ $calls = @(
   @{ jsonrpc = '2.0'; id = 6; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = 'שטר' ; all_databases = $true } } },
   @{ jsonrpc = '2.0'; id = 7; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = 'קקקזזזפפפ'; all_databases = $true } } },
   @{ jsonrpc = '2.0'; id = 8; method = 'tools/call'; params = @{ name = 'open_text'; arguments = @{ reference = 'שוע אוח רסג'; max_chars = 800 } } },
-  @{ jsonrpc = '2.0'; id = 9; method = 'tools/call'; params = @{ name = 'open_text'; arguments = @{ reference = 'שבת ד ב'; max_chars = 300 } } },
+  @{ jsonrpc = '2.0'; id = 9; method = 'tools/call'; params = @{ name = 'open_text'; arguments = @{ reference = 'שבת ד ב'; max_chars = 500 } } },
   @{ jsonrpc = '2.0'; id = 10; method = 'tools/call'; params = @{ name = 'open_text'; arguments = @{ reference = 'בבלי ברכות סה א' } } },
   @{ jsonrpc = '2.0'; id = 11; method = 'tools/call'; params = @{ name = 'search'; arguments = @{ query = 'x'; limit = 99 } } },
   @{ jsonrpc = '2.0'; id = 12; method = 'tools/call'; params = @{ name = 'status'; arguments = @{} } },
@@ -64,6 +64,12 @@ foreach ($c in $calls) {
   $short = if ($resp.Length -gt $Width) { $resp.Substring(0, $Width) + '...' } else { $resp }
   "[{0}] {1} ({2:N1}s)`n    {3}" -f $c.id, $label, $sw.Elapsed.TotalSeconds, $short
   $name = $c.params.name
+  # IT-868: open_text's source is never empty; several matches name the one opened
+  if ($name -eq 'open_text' -and $resp -notmatch '"isError":true') {
+    $ob = ($resp | ConvertFrom-Json).result.content[0].text | ConvertFrom-Json
+    Assert ([string]$ob.source).Trim().Length -gt 0 "[$($c.id)] open_text source is filled: $($ob.source)"
+    if ($ob.note) { Assert ($ob.opened -and @($ob.candidates).Count -gt 1) "[$($c.id)] several matches: opened and candidates given" }
+  }
   if ($name -ne 'search' -and $name -ne 'get_results') { continue }
   $r = $resp | ConvertFrom-Json
   if ($r.result.isError) { if ($name -eq 'get_results' -or $same -or $scope) { Assert $false "[$($c.id)] returned an error" }; continue }
@@ -71,6 +77,8 @@ foreach ($c in $calls) {
   $replies[$c.id] = $body
   if ($scope) { Assert ((@($body.scope) -join ' | ') -eq ($scope -join ' | ')) "[$($c.id)] scope is $($scope -join ' | '): $(@($body.scope) -join ' | ')" }
   $ns = @(@($body.results) | Where-Object { $_ } | ForEach-Object { [int]$_.n })
+  # IT-868: on Responsa 29, [3:1] is rejected and run once more as [1:3]
+  if ($c.id -eq 5) { Assert ($body.ran_as -eq 'נר [1:3] שבת' -and $body.total -gt 0) "[5] distance retried swapped: ran_as $($body.ran_as), total $($body.total)" }
   if ($name -eq 'search') {
     if ($ns.Count -gt 0) { Assert (($ns -join ',') -eq ((1..$ns.Count) -join ',')) "[$($c.id)] search numbered 1..$($ns.Count): $($ns -join ',')" }
   } else {
@@ -91,5 +99,5 @@ $in.Close()
 if (-not $p.WaitForExit(30000)) { 'server did not exit after stdin closed'; $p.Kill() }
 "server exit code: $($p.ExitCode); RESPONSA processes left: $(@(Get-Process RESPONSA -EA SilentlyContinue).Count)"
 $err = $p.StandardError.ReadToEnd(); if ($err) { "stderr: $err" }
-"IT-793 assertions: $ok passed, $bad failed"
+"assertions: $ok passed, $bad failed"
 if ($bad -gt 0) { exit 1 }

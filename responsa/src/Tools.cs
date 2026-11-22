@@ -6,6 +6,39 @@ using System.Linq;
 
 namespace ResponsaMcp
 {
+    /// <summary>
+    /// IT-868: the order of a distance range differs between Responsa versions. Measured: Responsa 29 (here) and 34 (a
+    /// pilot's doctor) take [min:max] and reject [3:1]; Responsa 31 (a pilot) rejects [1:3] with "המרחק המקסימלי קטן
+    /// מהמרחק המינימלי" and takes [3:1]. So 31 reads the first number as the maximum. Swapping both numbers of every
+    /// [a:b] gives the same range in that version's order, also with a negative part: [-5:5] (from 5 before to 5 after)
+    /// becomes [5:-5], i.e. max 5, min -5 on 31. A range of one number ([3]) or with equal numbers is left as it is.
+    /// </summary>
+    internal static class Distance
+    {
+        public const string OrderError = "המרחק המקסימלי קטן מהמרחק המינימלי";
+        static readonly System.Text.RegularExpressions.Regex Range = new System.Text.RegularExpressions.Regex(@"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]");
+
+        public static bool IsOrderError(IEnumerable<string> messages)
+        {
+            return messages != null && messages.Any(m => m != null && m.Replace("  ", " ").Contains(OrderError));
+        }
+
+        /// <summary>Every [a:b] as [b:a]; the rest of the query unchanged.</summary>
+        public static string Swap(string query)
+        {
+            return Range.Replace(query, m => "[" + m.Groups[2].Value + ":" + m.Groups[1].Value + "]");
+        }
+
+        public static string Note(string ranAs, List<string> first, bool worked)
+        {
+            string said = first != null && first.Count > 0 ? " (Responsa: " + first[0] + ")" : "";
+            return worked
+                ? "this Responsa version wants the other order in [a:b]" + said + ": Responsa 31 reads [max:min], 29 and 34 [min:max]. "
+                  + "The numbers of every [a:b] were swapped, and the search ran as: " + ranAs
+                : "Responsa rejected the distance range in both orders" + said + "; check the numbers in [a:b] (ran last as: " + ranAs + ")";
+        }
+    }
+
     internal sealed class Tools
     {
         public const int MaxResultsPerCall = 50;
@@ -99,6 +132,7 @@ namespace ResponsaMcp
                 r["responsa_installs"] = inst.Install.Report();   // IT-827: every install found, the one used marked
                 r["instance_pid"] = (long)inst.Pid;
                 r["private_desktop"] = ui.DesktopName;
+                r["environment"] = ResponsaEnv.Get().Report();   // IT-868
                 r["editor_responsa_running"] = inst.EditorInstances();
                 r["open_searches"] = searches.Select(s => (object)new Dictionary<string, object> { { "search_id", s.Id }, { "query", s.Query }, { "total", s.Total } }).ToList();
                 r["startup"] = inst.StartupLog.ToList();
@@ -120,6 +154,7 @@ namespace ResponsaMcp
             foreach (var kv in VersionReport(ins, WorkspaceFile.Find(ins.DataDir, ins.Major))) r[kv.Key] = kv.Value;
             r["data_folder"] = ins.DataDir;
             r["responsa_installs"] = ins.Report();   // IT-827
+            r["environment"] = ResponsaEnv.Get().Report();   // IT-868: what RESPONSA.exe will be started with
             return r;
         }
 
@@ -182,9 +217,23 @@ namespace ResponsaMcp
                     scope = ui.Run(delegate () { return Ui.SelectBooks((uint)pid, books, bookIndex, delegate { scoped = true; }); }, 240000);
                     allDatabases = 0;
                 }
-                var outcome = ui.Run(delegate () { return Ui.Search((uint)pid, query, allDatabases, timeoutSec); }, (timeoutSec + 30) * 1000);
+                int all = allDatabases;
+                Func<string, Ui.SearchOutcome> run = q => ui.Run(delegate () { return Ui.Search((uint)pid, q, all, timeoutSec); }, (timeoutSec + 30) * 1000);
+                var outcome = run(query);
+                // IT-868: Responsa 31 reads [a:b] as [max:min], 29 and 34 as [min:max]. Rejected for that: once more, swapped.
+                string ranAs = null; List<string> firstMessages = null;
+                if (outcome.Window == IntPtr.Zero && Distance.IsOrderError(outcome.Messages))
+                {
+                    string swapped = Distance.Swap(query);
+                    if (swapped != query) { firstMessages = outcome.Messages; ranAs = swapped; outcome = run(swapped); }
+                }
                 var r = new Dictionary<string, object>();
                 r["query"] = query;
+                if (ranAs != null)
+                {
+                    r["ran_as"] = ranAs;
+                    r["distance_note"] = Distance.Note(ranAs, firstMessages, outcome.Window != IntPtr.Zero || !Distance.IsOrderError(outcome.Messages));
+                }
                 if (scope != null)
                 {
                     r["scope"] = scope.Nodes.Select(b => (object)b.Display).ToList();
@@ -193,11 +242,16 @@ namespace ResponsaMcp
                 if (note != null) r["note"] = note;
                 r["seconds"] = outcome.Seconds;
                 if (outcome.Messages.Count > 0) r["responsa_messages"] = outcome.Messages;
+                foreach (var m in outcome.Messages)
+                {
+                    string hint = ResponsaEnv.Hint(m);   // IT-868: error 15
+                    if (hint != null) { r["hint"] = hint; break; }
+                }
                 if (outcome.Breakdown.Count > 0)
                     r["by_database"] = outcome.Breakdown.OrderByDescending(kv => kv.Value).Select(kv => (object)new Dictionary<string, object> { { "database", kv.Key }, { "results", kv.Value } }).ToList();
                 if (outcome.Window == IntPtr.Zero) { r["total"] = 0; return (object)r; }
 
-                var st = new SearchState { Id = nextSearchId++, Query = query, Total = outcome.Total, Window = outcome.Window };
+                var st = new SearchState { Id = nextSearchId++, Query = ranAs ?? query, Total = outcome.Total, Window = outcome.Window };
                 searches.Add(st);
                 TrimSearchWindows();
                 r["search_id"] = st.Id;
@@ -275,13 +329,38 @@ namespace ResponsaMcp
                 }
                 var r = new Dictionary<string, object>();
                 r["reference"] = reference;
-                r["source"] = t.Title;
-                if (title != null && title != t.Title) r["source_short"] = title;
-                if (t.Candidates > 1) r["note"] = "Responsa matched " + t.Candidates + " sources and opened its first choice (see 'source'); give a more specific reference for another one.";
+                foreach (var kv in SourceFields(t.Title, title, t.Chosen, t.Candidates, t.Names)) r[kv.Key] = kv.Value;
                 if (text.Length > maxChars) { r["text"] = text.Substring(0, maxChars); r["truncated"] = true; r["chars_total"] = text.Length; }
                 else r["text"] = text;
                 return (object)r;
             });
+        }
+
+        /// <summary>
+        /// IT-868: `source` is never empty. It is the text window's title; without one, the item opened from the choice
+        /// list, else the title line of the saved text (`source_from` says which). With several matches, the list
+        /// (`candidates`) and the item opened (`opened`) are given as well.
+        /// </summary>
+        internal static Dictionary<string, object> SourceFields(string windowTitle, string savedTitle, string chosen, int candidates, List<string> names)
+        {
+            var r = new Dictionary<string, object>();
+            windowTitle = (windowTitle ?? "").Trim(); savedTitle = string.IsNullOrEmpty(savedTitle) ? null : savedTitle.Trim();
+            chosen = string.IsNullOrEmpty(chosen) ? null : chosen.Trim();
+            if (windowTitle.Length > 0) r["source"] = windowTitle;
+            else if (chosen != null) { r["source"] = chosen; r["source_from"] = "the window had no title; this is the item opened from Responsa's choice list"; }
+            else if (savedTitle != null) { r["source"] = savedTitle; r["source_from"] = "the window had no title; this is the title line of the saved text"; }
+            else { r["source"] = "(Responsa gave no title for this text)"; }
+            if (savedTitle != null && savedTitle != (string)r["source"]) r["source_short"] = savedTitle;
+            if (candidates > 1)
+            {
+                var listed = (names ?? new List<string>()).Where(n => !string.IsNullOrEmpty(n)).ToList();
+                if (listed.Count > 0) r["candidates"] = listed.Cast<object>().ToList();
+                if (chosen != null) r["opened"] = chosen;
+                r["note"] = "Responsa matched " + candidates + " sources and opened its first choice" + (chosen != null ? " ('" + chosen + "')" : "")
+                    + (listed.Count > 0 ? "; the others are in 'candidates'" + (candidates > listed.Count ? " (first " + listed.Count + ")" : "") : "")
+                    + ". Give a more specific reference for another one.";
+            }
+            return r;
         }
 
         // ------------------------------------------------------------------ housekeeping
