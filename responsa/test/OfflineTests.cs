@@ -35,11 +35,81 @@ namespace ResponsaMcp
             EnvTests();        // IT-868
             DistanceTests();   // IT-868
             SourceTests();     // IT-868
+            SaveRaceTests();   // IT-871
             Check(Ui.FixBidi("(תלמוד ירושלמי (וילנא") == "תלמוד ירושלמי (וילנא)", "FixBidi visual parenthesis");
             Check(Ui.FixBidi("תלמוד בבלי") == "תלמוד בבלי", "FixBidi plain");
             Check(McpServer.Serialize(new Dictionary<string, object> { { "t", "גמ' <a> & b" } }) == "{\"t\":\"גמ' <a> & b\"}", "Serialize keeps ' < > & plain");
             Console.WriteLine(string.Format("{0} passed, {1} failed", passed, failed));
             return failed == 0 ? 0 : 1;
+        }
+
+        // ---- IT-871: a slow save is never taken for "saved elsewhere"; every round has its own path; the exists prompt
+        static Ui.SaveState S(bool here, bool open, bool ourBox, bool otherBox, bool closed, bool idle, double sinceClosed, double sinceBox, double unchanged)
+        {
+            return new Ui.SaveState { Here = here, Open = open, OurBox = ourBox, OtherBox = otherBox, FileClosed = closed, Idle = idle, SinceClosed = sinceClosed, SinceBox = sinceBox, Unchanged = unchanged };
+        }
+        static void SaveRaceTests()
+        {
+            // Measured on Responsa 29: results 101-102 took over 6 s before the file appeared (0 B, open, Responsa busy).
+            Check(Ui.SaveOutcome(S(false, false, false, false, false, false, 6.4, -1, 6.4)) == "wait", "slow save, Responsa busy, no file after 6.4 s: wait (was 'elsewhere')");
+            Check(Ui.SaveOutcome(S(false, false, false, false, false, false, 40, -1, 40)) == "wait", "Responsa busy: never 'elsewhere', however long");
+            Check(Ui.SaveOutcome(S(false, false, false, false, false, true, 6.4, -1, 6.4)) == "wait", "idle, no box, 6.4 s: still wait");
+            Check(Ui.SaveOutcome(S(false, false, false, false, false, true, Ui.IdleElsewhere + 0.5, -1, 16)) == "elsewhere", "idle, no box, no file after 15 s: elsewhere");
+            Check(Ui.SaveOutcome(S(false, true, false, false, false, true, -1, -1, 20)) == "wait", "Save As still open: wait");
+            // The box Responsa shows after writing
+            Check(Ui.SaveOutcome(S(true, false, true, false, false, false, 0.5, 0.1, 0)) == "saved", "file and our box: saved");
+            Check(Ui.SaveOutcome(S(false, false, true, false, false, true, 1, 3.5, 3.5)) == "elsewhere", "our box but no file after 3 s: elsewhere");
+            Check(Ui.SaveOutcome(S(false, false, false, true, false, true, 1, 3.5, 3.5)) == "elsewhere", "a box for another path, no file: elsewhere");
+            Check(Ui.SaveOutcome(S(false, false, false, true, false, false, 1, 3.5, 3.5)) == "wait", "a box for another path while Responsa is busy: wait");
+            Check(Ui.SaveOutcome(S(false, false, true, false, false, true, 1, 2, 2)) == "wait", "our box, no file yet, 2 s: wait");
+            // No box (a version that shows none): only a closed, quiet file while Responsa is idle
+            Check(Ui.SaveOutcome(S(true, false, false, false, true, true, 2.5, -1, 2.5)) == "saved", "no box: closed, quiet, idle file: saved");
+            Check(Ui.SaveOutcome(S(true, false, false, false, true, true, 2.5, -1, 1)) == "wait", "no box: file still changing: wait");
+            Check(Ui.SaveOutcome(S(true, false, false, false, true, false, 2.5, -1, 2.5)) == "wait", "no box: Responsa busy (between writes): wait");
+            Check(Ui.SaveOutcome(S(true, false, false, false, false, true, 2.5, -1, 2.5)) == "wait", "no box: file still open: wait");
+            Check(Ui.SaveOutcome(S(true, false, false, false, true, true, 1, -1, 2.5)) == "wait", "no box: window closed under 2 s ago: wait");
+
+            // Fresh paths: never the first one, never one used or existing
+            string dir = Path.Combine(Path.GetTempPath(), "responsa-it871-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string first = Path.Combine(dir, "abc.txt");
+                var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { first };
+                string p2 = Ui.FreshPath(first, used);
+                Check(p2 == Path.Combine(dir, "abc-2.txt"), "FreshPath: abc-2.txt beside the first (" + p2 + ")");
+                used.Add(p2);
+                string p3 = Ui.FreshPath(first, used);
+                Check(p3 == Path.Combine(dir, "abc-3.txt"), "FreshPath: a used name (even with no file yet) is skipped (" + p3 + ")");
+                File.WriteAllText(Path.Combine(dir, "abc-3.txt"), "x");
+                File.WriteAllText(Path.Combine(dir, "abc-4.txt"), "x");
+                string p5 = Ui.FreshPath(first, new HashSet<string> { first, p2 });
+                Check(p5 == Path.Combine(dir, "abc-5.txt"), "FreshPath: an existing name is skipped (" + p5 + ")");
+                File.WriteAllText(first, "x");
+                File.WriteAllText(Path.Combine(dir, "abc-x.txt"), "x");
+                File.WriteAllText(Path.Combine(dir, "abc-02.txt"), "x");
+                File.WriteAllText(Path.Combine(dir, "abcd-2.txt"), "x");
+                var all = Ui.SavePaths(first).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal).ToList();
+                Check(string.Join(",", all.ToArray()) == "abc-3.txt,abc-4.txt,abc.txt", "SavePaths: the first and its -N names only (" + string.Join(",", all.ToArray()) + ")");
+            }
+            finally { Directory.Delete(dir, true); }
+
+            // The prompt as measured on Responsa 29, and boxes that are not it
+            var prompt = new List<KeyValuePair<int, string>> {
+                new KeyValuePair<int, string>(1056, "&הוסף"), new KeyValuePair<int, string>(1, "&שכתב"),
+                new KeyValuePair<int, string>(57670, "ע&זרה"), new KeyValuePair<int, string>(2, "&ביטול") };
+            string promptText = "קיים כבר קובץ בשם שבחרת. | בחר \"הוסף\" - להוספת החומר לסוף הקובץ הקיים, או בחר \"שכתב\" - לביטול הקובץ הקיים.";
+            Check(SaveDialog.IsExistsPrompt(promptText, prompt), "exists prompt recognized");
+            Check(SaveDialog.IsExistsPrompt("", prompt), "exists prompt recognized by its buttons alone");
+            Check(SaveDialog.IsExistsPrompt("קיים כבר קובץ בשם שבחרת.", new List<KeyValuePair<int, string>> { new KeyValuePair<int, string>(2, "&ביטול") }), "exists prompt recognized by its text alone");
+            Check(SaveDialog.PromptButton(prompt, "ביטול") == 2 && SaveDialog.PromptButton(prompt, "שכתב") == 1 && SaveDialog.PromptButton(prompt, "הוסף") == 1056, "prompt buttons by label");
+            Check(SaveDialog.PromptButton(prompt, "אישור") == -1, "no such button: -1");
+            Check(!SaveDialog.IsExistsPrompt("הקובץ נשמר", new List<KeyValuePair<int, string>> { new KeyValuePair<int, string>(2, "OK") }), "the saved box is not the exists prompt");
+            Check(!SaveDialog.IsExistsPrompt("לא נמצאה כל תוצאה!", new List<KeyValuePair<int, string>> { new KeyValuePair<int, string>(1, "אישור") }), "another message is not the exists prompt");
+
+            // Box titles: Responsa titles them with the path
+            Check(Ui.BoxPath(@"C:\Users\x\AppData\Local\ResponsaMcp\tmp\1-2\abc.txt") == @"C:\Users\x\AppData\Local\ResponsaMcp\tmp\1-2\abc.txt", "BoxPath: a path title");
+            Check(Ui.BoxPath("RESPONSA") == null && Ui.BoxPath("") == null && Ui.BoxPath(null) == null, "BoxPath: other titles are none");
         }
 
         // ---- IT-868: the environment RESPONSA.exe is started with

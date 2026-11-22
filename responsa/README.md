@@ -118,11 +118,24 @@ The tool recognizes both by their parts: the file-name field (the one visible ed
 2. If the type box has a "UNICODE" entry and another type is chosen, it chooses the Unicode one, the way a pick from the list would.
 3. It types the tool's path into the file-name field and checks that the field still holds exactly that path a moment later.
 4. It presses Save. The save counts only if the file appears at the tool's own path. A file Responsa wrote elsewhere (for example `respsrch` in Responsa's own `TEMP` folder) is never read.
-5. If Responsa saved elsewhere, the save is repeated once, with the path put in by `WM_SETTEXT` instead of typed. If that also fails, the error names the version and says what the window did (also printed by `doctor` as `save_dialog`).
+5. If Responsa saved elsewhere, the save is repeated once, with the path put in by `WM_SETTEXT` instead of typed, and to a new file name (IT-871). If that also fails, the error names the version and says what the window did (also printed by `doctor` as `save_dialog`).
 
-Why typing: a pilot user's Responsa 34 saved to its default name `respsrch` even though the tool had put its path in the field. A scratch program on this PC shows the same with the item dialog: after its type changes, the dialog resets the name to its default. It then saves under that internal name, even while the field shows a path put in by `WM_SETTEXT`. A typed path is taken. Measured on Responsa 29: both ways work, and 16 saves in a row went through on the typed first round. Once in a live run, the typed round did not reach the tool's path and the second round saved correctly; the cause was not found.
+Why typing: a pilot user's Responsa 34 saved to its default name `respsrch` even though the tool had put its path in the field. A scratch program on this PC shows the same with the item dialog: after its type changes, the dialog resets the name to its default. It then saves under that internal name, even while the field shows a path put in by `WM_SETTEXT`. A typed path is taken. Measured on Responsa 29: both ways work, and 16 saves in a row went through on the typed first round. Once in a live run, the typed round did not reach the tool's path and the second round saved correctly; IT-871 found the cause (next section).
 
-`build.ps1 -DialogTest` drives this code against a scratch program's Save As windows on a private desktop: both kinds, a type that starts on the non-Unicode entry, a name reset after the window is shown, a program that saves elsewhere, and a window that never keeps the path. No Responsa is needed.
+### Slow saves and the "file exists" prompt (IT-871)
+
+About once per full live test, a save showed Responsa's prompt "קיים כבר קובץ בשם שבחרת … הוסף / שכתב" for the tool's own temp file, and the instance was restarted. Measured on Responsa 29 (`RESPONSA_MCP_SAVE_TRACE`, below): saving results 101-102 can take Responsa more than 6 s before the file even appears. During that time it uses about a full CPU core, while its window still answers messages. The tool used to decide "saved elsewhere" after 6 s without a file and tried again **with the same path**. That second round then deleted the file Responsa was still writing, or found it in use (an internal error), or Responsa found it and asked whether to append or overwrite.
+
+Now:
+
+- Every round of a save gets a file name never used before in that call (`<name>-2.txt`, ...). The tool never deletes a file before a save, and removes all of them after reading.
+- "Saved elsewhere" needs Responsa to be idle: its window answers and it has used almost no CPU for a second. Then it needs either 3 s after Responsa's "saved" box with no file, or 15 s with no file and no box. While Responsa is busy, the tool waits, up to 45 s.
+- A late "הקובץ נשמר" box from an earlier save is closed, never taken as a refusal.
+- If the prompt still appears, "הוסף" (append) is never pressed. The first time, the tool presses "ביטול". Responsa then shows the Save As window again, and the tool saves to a new name, pressing Save once. A second prompt in the same save is answered "שכתב" only if it names that new file, which only this save can have written. Anything else cancels both windows and returns an error. The instance is not restarted and the searches stay.
+
+`RESPONSA_MCP_SAVE_TRACE=<file>` (optional, for measuring) appends every save step to that file: the path, when Save was pressed, the windows Responsa showed, the file's size and times, and Responsa's CPU and I/O while the tool waits.
+
+`build.ps1 -DialogTest` drives this code against a scratch program's Save As windows on a private desktop: both kinds, a type that starts on the non-Unicode entry, a name reset after the window is shown, a program that saves elsewhere, a window that never keeps the path, and (IT-871) Responsa's "file exists" prompt: once, twice, and with a name that is not the tool's. No Responsa is needed.
 - **Which workspace file is protected:** the tool looks in `DATA\` for `responsaext1.0NN` (three digits, the first `0`; a longer name such as `responsaext1.029_` does not count). It decides once, each time its instance starts:
   - **One such file:** that file is protected, as described above.
   - **None:** the name this version is expected to create (`responsaext1.030` for Responsa 30; `.029` if the version cannot be read) is protected as a file that did not exist before, so a file only the tool's instance creates there is removed.

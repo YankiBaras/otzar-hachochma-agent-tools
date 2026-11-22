@@ -41,6 +41,13 @@ namespace ResponsaMcp
                     new { Mode = "classic-hebrew", Typed = true, Want = "saved" },
                     new { Mode = "item-elsewhere", Typed = false, Want = "elsewhere" },
                     new { Mode = "item-stubborn", Typed = false, Want = "stuck" },
+                    // IT-871: Responsa's "file exists" prompt is cancelled and the save goes to a fresh name; a second
+                    // prompt, for that fresh name, is answered "שכתב"; "הוסף" is never pressed
+                    new { Mode = "item-exists", Typed = true, Want = "fresh" },
+                    new { Mode = "classic-exists", Typed = true, Want = "fresh" },
+                    new { Mode = "item-exists2", Typed = true, Want = "fresh" },
+                    // a second prompt that does not name the tool's fresh file: both windows cancelled, an error, no restart
+                    new { Mode = "item-existsodd", Typed = true, Want = "error" },
                 };
                 foreach (var c in cases) Run(ui, host, root, c.Mode, c.Typed, c.Want);
             }
@@ -76,7 +83,8 @@ namespace ResponsaMcp
                 { Check(false, name + "could not start the host"); return 0; }
                 Native.CloseHandle(pi.hThread);
                 string outcome; var sw = Stopwatch.StartNew();
-                try { outcome = Ui.FillAndSave((uint)pi.dwProcessId, path, typed) == path ? "saved" : "elsewhere"; }
+                string fresh = Path.Combine(dir, Path.GetFileNameWithoutExtension(path) + "-2.txt"), got = null;
+                try { got = Ui.FillAndSave((uint)pi.dwProcessId, path, typed); outcome = got == path ? "saved" : got == fresh ? "fresh" : got == null ? "elsewhere" : "other: " + got; }
                 catch (StuckError e) { outcome = "stuck"; Console.WriteLine("    " + e.Message); }
                 catch (ToolError e) { outcome = "error"; Console.WriteLine("    " + e.Message); }
                 Console.WriteLine("    " + Ui.LastSave + " (" + sw.ElapsedMilliseconds + " ms)");
@@ -92,6 +100,18 @@ namespace ResponsaMcp
                     Check(lines.Length == 1 && lines[0] == "OK|2|" + path, name + "the host saved to the tool's path with the Unicode type (" + string.Join(" ", lines) + ")");
                     Check(File.Exists(path) && SaveParse.ReadSaved(path).StartsWith("החיפוש : test"), name + "the file at the tool's path reads back");
                 }
+                if (want == "fresh")
+                {
+                    bool twice = mode.EndsWith("-exists2");
+                    string expect = "EXISTS|2|" + path + (twice ? " EXISTS|1|" + fresh : "") + " OK|2|" + fresh;
+                    Check(string.Join(" ", lines) == expect, name + "the prompt was cancelled" + (twice ? ", then overwrote the fresh name" : "") + ", the save went to the fresh name (" + string.Join(" ", lines) + ")");
+                    Check(SaveParse.ReadSaved(fresh) == "החיפוש : test " + mode + "\r\n", name + "the fresh file holds exactly the new text (nothing appended)");
+                    Check(SaveParse.ReadSaved(path) == "LATE text of an earlier save\r\n", name + "the earlier file was left as it was (not appended to, not overwritten)");
+                    Check(!lines.Any(l => l.StartsWith("EXISTS|1056")), name + "\"הוסף\" was never pressed");
+                }
+                if (want == "error")
+                    Check(string.Join(" ", lines) == "EXISTS|2|" + path + " EXISTS|2|" + fresh + " CANCEL|2|" + fresh && Ui.LastSave.Length > 0,
+                        name + "both prompts and the Save As window were cancelled, nothing written (" + string.Join(" ", lines) + ")");
                 if (want == "elsewhere")
                     Check(!File.Exists(path) && File.Exists(Path.Combine(dir, "respsrch")), name + "nothing at the tool's path; the host's own file was not taken");
                 if (want == "stuck")

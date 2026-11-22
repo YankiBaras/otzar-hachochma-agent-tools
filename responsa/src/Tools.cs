@@ -119,6 +119,8 @@ namespace ResponsaMcp
             return Path.Combine(tmpDir, Guid.NewGuid().ToString("N") + ".txt");
         }
         static void Delete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
+        /// <summary>IT-871: removes the temp file of a save and the fresh names it may have used (Ui.SavePaths).</summary>
+        static void DeleteSaves(string path) { foreach (var p in Ui.SavePaths(path)) Delete(p); }
 
         // ------------------------------------------------------------------ status
         public object Status()
@@ -281,12 +283,13 @@ namespace ResponsaMcp
             List<ResultItem> items;
             try
             {
-                ui.Run(delegate () { return Ui.SaveResultRange((uint)pid, st.Window, st.Total, from, to, path); }, 90000);
+                // IT-871: the save may end at a fresh name beside `path` (Ui.SaveVia); every one of them is removed.
+                string saved = ui.Run(delegate () { return Ui.SaveResultRange((uint)pid, st.Window, st.Total, from, to, path); }, 150000);
                 string q;
-                items = SaveParse.ParseResults(SaveParse.ReadSaved(path), out q);
+                items = SaveParse.ParseResults(SaveParse.ReadSaved(saved), out q);
             }
             catch (WindowGone) { searches.Remove(st); throw; }
-            finally { Delete(path); }
+            finally { DeleteSaves(path); }
             // IT-793: the save carries each result's real number. Anything but exactly from..to (marks of an earlier
             // save left over, a missing result) is never returned; the instance is restarted, which drops every mark.
             string wrong = SaveParse.CheckRange(items, from, to);
@@ -319,12 +322,12 @@ namespace ResponsaMcp
                 string text, title;
                 try
                 {
-                    ui.Run(delegate () { Ui.Activate((uint)pid, t.Window); return Ui.SaveVia((uint)pid, Ids.TextSaveAll, path); }, 90000);
-                    text = SaveParse.ParseText(SaveParse.ReadSaved(path), out title);
+                    string saved = ui.Run(delegate () { Ui.Activate((uint)pid, t.Window); return Ui.SaveVia((uint)pid, Ids.TextSaveAll, path); }, 150000);
+                    text = SaveParse.ParseText(SaveParse.ReadSaved(saved), out title);
                 }
                 finally
                 {
-                    Delete(path);
+                    DeleteSaves(path);
                     ui.Run(delegate () { Ui.CloseWindow((uint)pid, t.Window); return 0; }, 15000);
                 }
                 var r = new Dictionary<string, object>();

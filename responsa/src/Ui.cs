@@ -444,6 +444,25 @@ namespace ResponsaMcp
         /// <summary>IT-827: how the last save went (dialog kind, type, method), for `doctor`.</summary>
         public static string LastSave;
 
+        // IT-871 (measurement): with RESPONSA_MCP_SAVE_TRACE set to a file path, every save step is appended there.
+        static readonly string TracePath = Environment.GetEnvironmentVariable("RESPONSA_MCP_SAVE_TRACE");
+        static readonly Stopwatch TraceClock = Stopwatch.StartNew();
+        public static void Trace(string what)
+        {
+            if (string.IsNullOrEmpty(TracePath)) return;
+            try { File.AppendAllText(TracePath, string.Format("{0:HH:mm:ss.fff} +{1,8} {2}" + Environment.NewLine, DateTime.Now, TraceClock.ElapsedMilliseconds, what), System.Text.Encoding.UTF8); } catch { }
+        }
+        static string FileState(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return "absent";
+                var fi = new FileInfo(path);
+                return "present " + fi.Length + " B, created " + fi.CreationTime.ToString("HH:mm:ss.fff") + ", written " + fi.LastWriteTime.ToString("HH:mm:ss.fff");   // never opened here: Responsa may be writing it
+            }
+            catch (Exception e) { return "unknown (" + e.Message + ")"; }
+        }
+
         /// <summary>
         /// A window that looks like a Save As window that is still being built: an item-dialog view, or an Edit in a
         /// combo box. It is waited for, never answered like a message box.
@@ -462,31 +481,166 @@ namespace ResponsaMcp
         /// field before Save is pressed, and the save counts only if the file appears at the tool's own path; a file
         /// elsewhere is never read. If Responsa saved elsewhere, the save is tried once more with WM_SETTEXT (the
         /// method measured on Responsa 29); then it is an error naming the version.
+        /// IT-871 (measured on Responsa 29 with RESPONSA_MCP_SAVE_TRACE): saving results 101-102 took Responsa over 6 s
+        /// before the file even appeared. The old fixed 6 s "saved elsewhere" then fired and the retry used the same
+        /// path: it deleted the file Responsa was still writing, or Responsa found it and asked "קיים כבר קובץ בשם
+        /// שבחרת" (and the instance was restarted), or the file was in use (an internal error). Now every round has a
+        /// path never used before in this request, nothing here deletes a file, and "elsewhere" needs Responsa to be
+        /// idle (SaveOutcome). Returns the path the text was saved to; the caller removes every path of this save
+        /// (SavePaths).
         /// </summary>
         public static string SaveVia(uint pid, int command, string path)
         {
             var rounds = new List<string>();
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int round = 0; round < 2; round++)
             {
-                if (File.Exists(path)) File.Delete(path);
+                string p = round == 0 && !File.Exists(path) ? path : FreshPath(path, used);
+                used.Add(p);
+                Trace("round " + round + ": command " + command + ", path " + p + " " + FileState(p));
                 Command(pid, command);
                 string r;
-                try { r = FillAndSave(pid, path, round == 0); }
+                try { r = FillAndSave(pid, p, round == 0, used); }
+                catch (Exception e) { Trace("round " + round + " threw " + e.GetType().Name + ": " + e.Message); throw; }
                 finally { rounds.Add(LastSave); LastSave = string.Join("; then ", rounds.ToArray()); }
-                if (r != null) return path;
+                if (r != null) return r;
             }
             throw new ToolError(Version + " did not save to the tool's path (it saved under another name, or not at all). " +
                 "Nothing was read. Save As window: " + LastSave + ". Please report this with the output of responsa-mcp.exe doctor.");
         }
 
         /// <summary>
+        /// IT-871: a path for another save of the same request: "&lt;name&gt;-2.txt", "-3", ... beside `first`, never one that
+        /// exists or was already used (a slow earlier save may still write to it).
+        /// </summary>
+        public static string FreshPath(string first, ICollection<string> used)
+        {
+            string dir = Path.GetDirectoryName(first), stem = Path.GetFileNameWithoutExtension(first), ext = Path.GetExtension(first);
+            for (int k = 2; ; k++)
+            {
+                string p = Path.Combine(dir, stem + "-" + k + ext);
+                if (!File.Exists(p) && !used.Contains(p)) return p;
+            }
+        }
+
+        /// <summary>IT-871: every file a save that started at `first` may have written (`first` and its FreshPath names).</summary>
+        public static List<string> SavePaths(string first)
+        {
+            var r = new List<string> { first };
+            string dir = Path.GetDirectoryName(first), stem = Path.GetFileNameWithoutExtension(first), ext = Path.GetExtension(first);
+            if (Directory.Exists(dir))
+                foreach (var f in Directory.GetFiles(dir, stem + "-*" + ext))
+                {
+                    int k; string tail = Path.GetFileNameWithoutExtension(f).Substring(stem.Length + 1);
+                    if (int.TryParse(tail, out k) && k >= 2 && tail == k.ToString()) r.Add(f);
+                }
+            return r;
+        }
+
+        /// <summary>IT-871: what the wait after Save has seen so far. SaveOutcome decides from it, so it is tested offline.</summary>
+        public sealed class SaveState
+        {
+            public bool Here;          // a non-empty file at the tool's current path
+            public bool Open;          // the Save As window is still shown
+            public bool OurBox;        // Responsa's "הקובץ נשמר" box named the tool's current path
+            public bool OtherBox;      // a "saved" box that named no path of this save (Responsa saved elsewhere)
+            public bool FileClosed;    // nobody has the file open
+            public bool Idle;          // Responsa's main window answers at once (it is not busy writing)
+            public double SinceClosed = -1, SinceBox = -1, Unchanged;   // seconds; -1: not yet
+        }
+        public const double QuietSaved = 2, BoxElsewhere = 3, IdleElsewhere = 15;
+
+        /// <summary>
+        /// IT-871: "saved", "elsewhere" or "wait". A file and Responsa's box for it: saved (Responsa shows the box only
+        /// after writing). Without the box (a version that shows none): saved once Responsa is idle and the file is
+        /// closed and unchanged for QuietSaved s. No file: "elsewhere" BoxElsewhere s after a box, or IdleElsewhere s
+        /// after the window closed; both only while Responsa is idle, never while it is busy (the slow save of IT-871).
+        /// </summary>
+        public static string SaveOutcome(SaveState s)
+        {
+            if (s.Here && s.OurBox) return "saved";
+            if (s.Here && !s.Open && s.SinceClosed >= QuietSaved && s.FileClosed && s.Idle && s.Unchanged >= QuietSaved) return "saved";
+            if (!s.Here && !s.Open && s.Idle && (s.OurBox || s.OtherBox) && s.SinceBox > BoxElsewhere) return "elsewhere";
+            if (!s.Here && !s.Open && s.Idle && s.SinceClosed > IdleElsewhere) return "elsewhere";
+            return "wait";
+        }
+
+        /// <summary>
+        /// IT-871: whether Responsa has finished working on a save. Measured on Responsa 29 (trace of a slow save of
+        /// results 101-102): for about 5 s before the file appeared, Responsa used about one full core (0.8-1.3 s of CPU
+        /// per second) and hundreds of thousands of I/O operations, while its main window still answered WM_NULL. So it
+        /// counts as idle only when its main window answers WM_NULL within 500 ms AND it has used under 20% of a core
+        /// for the last QuietMs.
+        /// </summary>
+        sealed class IdleWatch
+        {
+            const double BusyShare = 0.2; const long QuietMs = 1000;
+            readonly uint pid; readonly Stopwatch clock = Stopwatch.StartNew();
+            double lastCpu = -1; long lastAt, quietSince;
+            public IdleWatch(uint pid) { this.pid = pid; Sample(); quietSince = 0; }
+            void Sample()
+            {
+                double cpu, io; Activity(pid, out cpu, out io);
+                long now = clock.ElapsedMilliseconds;
+                // CPU time that cannot be read is not counted (WM_NULL still is)
+                if (cpu >= 0 && lastCpu >= 0 && now > lastAt && (cpu - lastCpu) / (now - lastAt) > BusyShare) quietSince = now;
+                lastCpu = cpu; lastAt = now;
+            }
+            public bool Idle()
+            {
+                Sample();
+                IntPtr main = MainWindow(pid), r;
+                // the scratch program of the dialog test has no main window: only its CPU counts
+                bool answers = main == Z || Native.SendMessageTimeout(main, 0 /* WM_NULL */, Z, Z, 0x0002, 500, out r) != Z;
+                if (!answers) quietSince = clock.ElapsedMilliseconds;
+                return clock.ElapsedMilliseconds - quietSince >= QuietMs;
+            }
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool GetProcessIoCounters(IntPtr h, out IoCounters c);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct IoCounters { public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; }
+        /// <summary>IT-871: Responsa's CPU time (ms) and I/O operations so far; -1 if they could not be read.</summary>
+        static void Activity(uint pid, out double cpuMs, out double ioOps)
+        {
+            cpuMs = -1; ioOps = -1;
+            IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED, false, pid);
+            if (h == Z) return;
+            try
+            {
+                long c, e, k, u; IoCounters io;
+                if (Native.GetProcessTimes(h, out c, out e, out k, out u)) cpuMs = (k + u) / 10000.0;
+                if (GetProcessIoCounters(h, out io)) ioOps = io.ReadOps + io.WriteOps + io.OtherOps;
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>IT-871: the path a box is about (measured: Responsa titles its "saved" and "exists" boxes with it), or null.</summary>
+        public static string BoxPath(string title)
+        {
+            string t = (title ?? "").Trim();
+            return t.Length > 3 && t[1] == ':' && t[2] == '\\' ? t : null;
+        }
+
+        /// <summary>For the dialog test: FillAndSave with only `path` used so far.</summary>
+        public static string FillAndSave(uint pid, string path, bool typed)
+        {
+            return FillAndSave(pid, path, typed, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { path });
+        }
+
+        /// <summary>
         /// IT-827: the Save As part of SaveVia, for any process `pid` (the offline dialog test drives a scratch program
         /// with it). Waits for the window, lets it settle, chooses the Unicode type, puts `path` in (typed or not) and
-        /// checks it held, presses Save, and waits. Returns path when the file is at path; null when the window closed
-        /// and no file came to path (Responsa saved elsewhere). Throws ToolError if Responsa refused with a message,
+        /// checks it held, presses Save once, and waits. Returns the path the file is at; null when the window closed
+        /// and no file came (Responsa saved elsewhere). Throws ToolError if Responsa refused with a message,
         /// StuckError if the window was not recognized, did not keep the path, or did not close.
+        /// IT-871: Responsa's own "קיים כבר קובץ בשם שבחרת" prompt (measured on 29: buttons הוסף 1056, שכתב 1, עזרה,
+        /// ביטול 2; "ביטול" brings the Save As window back) is never answered "הוסף". The first time it is cancelled,
+        /// and the Save As window that comes back gets a fresh path (FreshPath). A second prompt in the same save is
+        /// answered "שכתב" only when it names that fresh path, which only this save can have written; otherwise it is
+        /// cancelled and the save fails. `used` collects the paths of this request.
         /// </summary>
-        public static string FillAndSave(uint pid, string path, bool typed)
+        public static string FillAndSave(uint pid, string path, bool typed, HashSet<string> used)
         {
             LastSave = "no Save As window recognized";
             IntPtr sv = Z, seen = Z; SaveDialog.Parts parts = null; var sw = Stopwatch.StartNew();
@@ -499,6 +653,8 @@ namespace ResponsaMcp
                     if (parts != null) { sv = d; break; }
                     if (LooksLikeFileDialog(d)) { seen = d; continue; }   // still being built: wait
                     string msg = Win.DialogMessage(d);
+                    // IT-871: the "הקובץ נשמר" box of an earlier, slow save can come now. Harmless (as in CheckNoMessage).
+                    if (msg.Contains("הקובץ נשמר")) { Trace("late box before Save As: '" + Win.Text(d) + "'"); Dismiss(d); continue; }
                     if (msg.Length > 0) { Dismiss(d); throw new ToolError("Responsa refused to save: " + msg); }
                 }
                 if (sv == Z) Thread.Sleep(150);
@@ -507,49 +663,151 @@ namespace ResponsaMcp
                 throw new StuckError("the Save As window of " + Version + " was not recognized (" + SaveDialog.Describe(seen) + ")");
             if (sv == Z) throw new StuckError("the Save As window did not open (" + Version + ")");
 
-            SaveDialog.Settle(parts, 500, 4000);
-            string defaultName = Win.Text(parts.Name), typeBefore = parts.Type != Z ? Win.Text(parts.Type) : null;
-            string type = SaveDialog.EnsureUnicode(parts, Version);
-            // Measured: a type change makes the item dialog reset the file name to its default, a moment later.
-            if (type != typeBefore) SaveDialog.Settle(parts, 500, 4000);
-            LastSave = parts.Kind + ", type '" + (type ?? "none") + "', default name '" + defaultName + "', path " + (typed ? "typed" : "set");
-            bool held = SaveDialog.PutName(parts, path, typed, 700);
-            // Typed but not kept (a field that changes typed input): WM_SETTEXT in the same window before giving up.
-            if (!held && typed) { LastSave += " (did not hold), then set"; held = SaveDialog.PutName(parts, path, false, 700); }
-            if (!held)
-                throw new StuckError("the Save As window of " + Version + " did not keep the tool's file name (it shows '" + Win.Text(parts.Name) + "'; " + LastSave + ")");
-            SaveDialog.PressSave(sv, parts);
+            Fill(sv, parts, path, typed, true);
+            string cur = path;
+            int prompts = 0;
+            bool reopening = false; var reopenWait = new Stopwatch();
 
             sw.Restart();
-            double closedAt = -1, boxAt = -1;
-            while (sw.ElapsedMilliseconds < 30000)
+            var traced = new HashSet<long>(); var answered = new HashSet<long>();
+            double closedAt = -1, boxAt = -1; bool ourBox = false, otherBox = false;
+            long lastTraced = -1; double tCpu, tIo; Activity(pid, out tCpu, out tIo);
+            var idle = new IdleWatch(pid);
+            long lastLen = -2; DateTime lastWrite = DateTime.MinValue; double unchangedSince = 0;
+            while (sw.ElapsedMilliseconds < 45000)
             {
                 Thread.Sleep(200);
                 foreach (var d in Win.Dialogs(pid))
                 {
                     if (IsSearchDialog(d) || IsIyun(d) || d == sv) continue;
-                    if (SaveDialog.Find(d) != null || LooksLikeFileDialog(d)) continue;
-                    string msg = Win.DialogMessage(d);
-                    if (msg.Contains("נשמר") || Win.Text(d) == path) { Dismiss(d); if (boxAt < 0) boxAt = sw.Elapsed.TotalSeconds; continue; }
+                    var again = SaveDialog.Find(d);
+                    if (again != null && reopening)
+                    {
+                        // IT-871: the Save As window Responsa shows again after "ביטול": a fresh path, Save pressed once.
+                        sv = d; parts = again; reopening = false;
+                        cur = FreshPath(path, used); used.Add(cur);
+                        LastSave += "; Responsa said the file exists: cancelled, then saved to a new name";
+                        Fill(sv, parts, cur, typed, false);
+                        closedAt = -1; boxAt = -1; ourBox = otherBox = false; lastLen = -2; idle = new IdleWatch(pid);
+                        sw.Restart();
+                        break;
+                    }
+                    if (again != null || LooksLikeFileDialog(d) || answered.Contains(d.ToInt64())) continue;
+                    string msg = Win.DialogMessage(d), about = BoxPath(Win.Text(d));
+                    var labels = Win.Kids(d).Where(k => Win.Class(k) == "Button").Select(k => new KeyValuePair<int, string>(Native.GetDlgCtrlID(k), Win.Text(k))).ToList();
+                    if (traced.Add(d.ToInt64()))
+                        Trace("after Save +" + sw.ElapsedMilliseconds + " ms: dialog '" + Win.Text(d) + "': " + msg + " [" + string.Join(", ", labels.Select(l => l.Key + "='" + l.Value + "'").ToArray()) + "]; Save As " + (Native.IsWindow(sv) && Native.IsWindowVisible(sv) ? "open" : "closed") + "; file " + FileState(cur));
+                    if (SaveDialog.IsExistsPrompt(msg, labels))
+                    {
+                        prompts++; answered.Add(d.ToInt64());
+                        int cancel = SaveDialog.PromptButton(labels, "ביטול"), overwrite = SaveDialog.PromptButton(labels, "שכתב");
+                        // Never "הוסף". First prompt: cancel; the Save As window that comes back gets a fresh path.
+                        if (prompts == 1 && cancel >= 0)
+                        {
+                            Win.Press(d, cancel); reopening = true; reopenWait.Restart();
+                            Trace("exists prompt for '" + about + "': pressed ביטול");
+                            continue;
+                        }
+                        // Again: overwrite only the fresh path of this save (nothing but this save can have written it).
+                        if (overwrite >= 0 && cur != path && about != null && string.Equals(about, cur, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Win.Press(d, overwrite);
+                            LastSave += "; Responsa said the new name exists too: overwrote the tool's own new file";
+                            Trace("exists prompt for '" + about + "': pressed שכתב");
+                            continue;
+                        }
+                        // Anything else: cancel the prompt and the Save As window it brings back; the instance and its
+                        // searches stay. Only if that cannot be done is it a StuckError (the instance is restarted).
+                        string why = Version + " said the tool's temp file already exists ('" + about + "'), " + prompts + " time(s) in one save; nothing was appended or overwritten and nothing was read";
+                        if (cancel >= 0) { Win.Press(d, cancel); CancelSaveAs(pid, d, why); throw new ToolError(why + "; please try again"); }
+                        throw new StuckError(Version + " said the tool's temp file already exists ('" + about + "'), " + prompts + " time(s) in one save; nothing was appended or overwritten and nothing was read (" + LastSave + ")");
+                    }
+                    if (msg.Contains("נשמר") || about != null)
+                    {
+                        Dismiss(d);
+                        if (about != null && string.Equals(about, cur, StringComparison.OrdinalIgnoreCase)) ourBox = true;
+                        else if (about != null && used.Contains(about)) { Trace("late box of an earlier path of this save: " + about); continue; }
+                        else otherBox = true;
+                        if (boxAt < 0) boxAt = sw.Elapsed.TotalSeconds;
+                        continue;
+                    }
                     if (msg.Length > 0) { Dismiss(d); throw new ToolError("Responsa did not save: " + msg); }
                 }
-                bool open = Native.IsWindow(sv) && Native.IsWindowVisible(sv);
-                if (!open && closedAt < 0) closedAt = sw.Elapsed.TotalSeconds;
-                bool here = File.Exists(path) && new FileInfo(path).Length > 0;
-                // Responsa's "הקובץ נשמר" box: the file is written (it is read once Responsa has closed it, SaveParse).
-                if (here && boxAt >= 0) { LastSave += ": saved"; return path; }
-                // IT-789 (found by the live test): Responsa keeps the file open until its "הקובץ נשמר" box is answered,
-                // and that box can come late. Without the box, return only once Responsa has closed the file.
-                if (here && !open && sw.ElapsedMilliseconds > 2000 && Closed(path)) { LastSave += ": saved"; return path; }
-                // The window closed (and Responsa said it saved, or said nothing for a while) with no file here: it saved elsewhere.
-                if (!here && !open && ((boxAt >= 0 && sw.Elapsed.TotalSeconds - boxAt > 3) || sw.Elapsed.TotalSeconds - closedAt > 6))
+                if (reopening)
                 {
-                    LastSave += ": no file at the tool's path (" + (boxAt >= 0 ? "Responsa said it saved" : "no message") + ", " + (File.Exists(path) ? "an empty file" : "no file") + ")";
+                    if (reopenWait.ElapsedMilliseconds > 10000) throw new StuckError("the Save As window of " + Version + " did not come back after its 'file exists' prompt was cancelled");
+                    continue;
+                }
+                bool open = Native.IsWindow(sv) && Native.IsWindowVisible(sv);
+                if (!open && closedAt < 0) { closedAt = sw.Elapsed.TotalSeconds; Trace("Save As closed +" + sw.ElapsedMilliseconds + " ms; file " + FileState(cur)); }
+                var fi = new FileInfo(cur);
+                bool exists = fi.Exists;
+                long len = exists ? fi.Length : -1; DateTime wt = exists ? fi.LastWriteTimeUtc : DateTime.MinValue;
+                if (len != lastLen || wt != lastWrite) { lastLen = len; lastWrite = wt; unchangedSince = sw.Elapsed.TotalSeconds; }
+                var st = new SaveState
+                {
+                    Here = exists && len > 0, Open = open, OurBox = ourBox, OtherBox = otherBox,
+                    SinceClosed = closedAt < 0 ? -1 : sw.Elapsed.TotalSeconds - closedAt,
+                    SinceBox = boxAt < 0 ? -1 : sw.Elapsed.TotalSeconds - boxAt,
+                    Unchanged = sw.Elapsed.TotalSeconds - unchangedSince,
+                };
+                // Idle and Closed are asked only when they can decide something (Idle can take up to 500 ms).
+                if (!open && !(st.Here && ourBox)) st.Idle = idle.Idle();
+                // Opened (with no sharing) only when it can decide: Responsa may still open the file to write more.
+                if (st.Here && !ourBox && st.Idle && st.SinceClosed >= QuietSaved && st.Unchanged >= QuietSaved) st.FileClosed = Closed(cur);
+                string outcome = SaveOutcome(st);
+                if (TracePath != null && sw.ElapsedMilliseconds / 1000 != lastTraced)
+                {
+                    lastTraced = sw.ElapsedMilliseconds / 1000; double cpu, io; Activity(pid, out cpu, out io);
+                    Trace("waiting +" + sw.ElapsedMilliseconds + " ms: cpu +" + (cpu - tCpu).ToString("0") + " ms, io +" + (io - tIo) + " ops; Save As " + (open ? "open" : "closed") + ", idle " + (open ? "?" : st.Idle.ToString()) + ", box " + (boxAt >= 0) + ", file " + FileState(cur) + " -> " + outcome);
+                    tCpu = cpu; tIo = io;
+                }
+                if (outcome == "saved") { LastSave += ": saved"; Trace("saved (" + (ourBox ? "box" : "quiet") + ") +" + sw.ElapsedMilliseconds + " ms to " + cur); return cur; }
+                if (outcome == "elsewhere")
+                {
+                    LastSave += ": no file at the tool's path (" + (boxAt >= 0 ? "Responsa said it saved" : "no message") + ", " + (exists ? "an empty file" : "no file") + ")";
+                    Trace("elsewhere +" + sw.ElapsedMilliseconds + " ms; file " + FileState(cur));
                     return null;
                 }
             }
             if (Native.IsWindow(sv) && Native.IsWindowVisible(sv)) throw new StuckError("the Save As window of " + Version + " did not close after Save");
             throw new StuckError("saving did not finish");
+        }
+
+        /// <summary>IT-871: after a cancelled "file exists" prompt, closes the Save As window Responsa shows again.</summary>
+        static void CancelSaveAs(uint pid, IntPtr prompt, string why)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 10000)
+            {
+                Thread.Sleep(150);
+                var sv = Win.Dialogs(pid).FirstOrDefault(d => d != prompt && SaveDialog.Find(d) != null);
+                if (sv == Z) continue;
+                Win.Press(sv, 2);   // IDCANCEL
+                while (Native.IsWindow(sv) && Native.IsWindowVisible(sv) && sw.ElapsedMilliseconds < 15000) Thread.Sleep(150);
+                if (!Native.IsWindow(sv) || !Native.IsWindowVisible(sv)) return;
+                break;
+            }
+            throw new StuckError(why + ", and its Save As window could not be closed");
+        }
+
+        /// <summary>Settles the Save As window, chooses the Unicode type, puts `path` in and checks it held, presses Save once.</summary>
+        static void Fill(IntPtr sv, SaveDialog.Parts parts, string path, bool typed, bool first)
+        {
+            SaveDialog.Settle(parts, 500, 4000);
+            string defaultName = Win.Text(parts.Name), typeBefore = parts.Type != Z ? Win.Text(parts.Type) : null;
+            string type = SaveDialog.EnsureUnicode(parts, Version);
+            // Measured: a type change makes the item dialog reset the file name to its default, a moment later.
+            if (type != typeBefore) SaveDialog.Settle(parts, 500, 4000);
+            if (first) LastSave = parts.Kind + ", type '" + (type ?? "none") + "', default name '" + defaultName + "', path " + (typed ? "typed" : "set");
+            else LastSave += " (type '" + (type ?? "none") + "')";
+            bool held = SaveDialog.PutName(parts, path, typed, 700);
+            // Typed but not kept (a field that changes typed input): WM_SETTEXT in the same window before giving up.
+            if (!held && typed) { LastSave += " (did not hold), then set"; held = SaveDialog.PutName(parts, path, false, 700); }
+            if (!held)
+                throw new StuckError("the Save As window of " + Version + " did not keep the tool's file name (it shows '" + Win.Text(parts.Name) + "'; " + LastSave + ")");
+            Trace("Save As " + parts.Kind + " shows '" + Win.Text(parts.Name) + "'; pressing Save; file " + FileState(path));
+            SaveDialog.PressSave(sv, parts);
         }
 
         // ------------------------------------------------------------------ open text by reference

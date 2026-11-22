@@ -169,6 +169,27 @@ namespace ResponsaMcp
             return false;
         }
 
+        static string Label(string s) { return (s ?? "").Replace("&", "").Trim(); }
+
+        /// <summary>
+        /// IT-871: Responsa's "a file with this name exists" prompt, by its parts. Measured on Responsa 29: title = the
+        /// path; Static 1057 "קיים כבר קובץ בשם שבחרת."; Static 1628 'בחר "הוסף" ... או בחר "שכתב" ...'; buttons
+        /// "&amp;הוסף" 1056, "&amp;שכתב" 1, "ע&amp;זרה" 57670, "&amp;ביטול" 2. It is the prompt when it has both an append and an
+        /// overwrite button, or its text says the file exists; the ids are not relied on.
+        /// </summary>
+        public static bool IsExistsPrompt(string message, IList<KeyValuePair<int, string>> buttons)
+        {
+            bool append = buttons.Any(b => Label(b.Value) == "הוסף"), overwrite = buttons.Any(b => Label(b.Value) == "שכתב");
+            return (append && overwrite) || (message ?? "").Contains("קיים כבר קובץ");
+        }
+
+        /// <summary>IT-871: the id of the button with this label (ampersands ignored), or -1.</summary>
+        public static int PromptButton(IList<KeyValuePair<int, string>> buttons, string label)
+        {
+            foreach (var b in buttons) if (Label(b.Value) == label) return b.Key;
+            return -1;
+        }
+
         /// <summary>Presses Save the way the dialog's own button would (WM_COMMAND to the dialog, from the button).</summary>
         public static void PressSave(IntPtr d, Parts p)
         {
