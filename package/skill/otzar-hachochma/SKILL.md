@@ -16,7 +16,7 @@ Otzar HaChochma is a licensed desktop library of scanned Torah books. The `otzar
    - If it says **Otzar HaChochma is stuck** (opened but not answering), relay the message: check that the disk is connected, close Otzar if it shows a message, and restart the PC if Otzar cannot be closed. Do not retry in a loop.
    - Read every `warnings` entry and tell the user about it in one line. A version warning means a newer Otzar than the one the tool was tested with; tools may still work.
 2. Once per working day, or when results look too few, call `status` with `coverage_check: true`. It runs a control search (`שבת`).
-   - If `coverage.ok` is false, tell the user that Otzar's search covers too few books. They should check the search settings in Otzar (a book list or filter may be selected, or a setting is stuck) or install the latest Otzar update. Do not tell them to run Otzar as administrator; that is not the fix.
+   - If `coverage.ok` is false, tell the user that Otzar's search covers too few books even on the whole library (the control search never uses the scope selected in Otzar). Suggest installing the latest Otzar update. Do not tell them to change Otzar's search scope or run Otzar as administrator; neither is the fix.
    - Until it is fixed, say clearly that search results are incomplete.
 
 ## Workflow
@@ -24,6 +24,9 @@ Otzar HaChochma is a licensed desktop library of scanned Torah books. The `otzar
 When the question is about a known book or set, the fastest order is: `find_book` → `search` with `book_ids` (its volumes) → `get_hit_context` → `get_page_text` or `get_page_image` to verify. For a question across the whole library:
 
 1. `search` with a query in Otzar syntax (below). The result has `total_results`, `books_with_results`, `library_books` and the top books by relevance, each with `book_id` and its number of `results`.
+   - **Scope.** Without `book_ids`, `search` always covers the whole library, even if the user selected a book group, list or selection in Otzar's search panel. Every result has `scope`: `{kind: "library", count}` or `{kind: "books", book_ids, count}`. Tell the user what was searched in those words (the whole library, or the chosen books). Never tell them that the search was limited to a group when `scope.kind` is `library`.
+   - If the result has `otzar_selected_scope`, the user has another scope chosen in Otzar (`kind`: `group`, `selected_books`, `current_list`, `browse`, `meforesh`, `tsiyunim`, `mefo`). The tool did not use it and did not change it. Mention it once, only if it matters: searches the user types in Otzar still use that scope. Do not ask the user to cancel it for the agent's sake.
+   - If the result has `scope_warning`, say it to the user plainly: the search may not have been what was asked (for example, `book_ids` were not honored, so treat it as a whole-library search).
 2. `search_hits` with a `book_id` from those results: the pages where the query matched (`page` = position in the book, `page_label` = the printed page or daf), with snippets. The hit words are marked «like this».
    - To search inside one book or one set only, pass `book_ids` to `search` (up to 200 ids, e.g. the `volume_ids` from `find_book`). It is faster and keeps the results to that book. It is still visible in Otzar's search panel, like any search.
    - `get_hit_context` with a `book_id` from the results gives each hit with only the words around it (`window`, default 15). Use it to judge hits before reading whole pages; page through with `offset`.
@@ -56,7 +59,7 @@ If a volume still does not appear, it may be listed under another title or spell
 
 `search_hits` works on the **current** search. If the user or another call ran a different search in the meantime, run `search` again.
 
-The search is typed into Otzar's own search panel, so the user sees each search there, it replaces what they had there, and Otzar adds it to its search history. Tell the user this before running many searches while they work in Otzar. A search limited with `book_ids` appears in Otzar's search history without its text (an Otzar quirk); this is harmless. If Otzar is busy with another search, the tool waits for it to finish first. If the user starts another search while the tool's search runs, the tool reports an error instead of returning the wrong results: just run it again.
+The search runs in Otzar's own search panel, so the user sees each search there, it replaces what they had there, and Otzar adds it to its search history. Tell the user this before running many searches while they work in Otzar. A search limited with `book_ids` appears in Otzar's search history without its text (an Otzar quirk); this is harmless. If Otzar is busy with another search, the tool waits for it to finish first. If the user starts another search while the tool's search runs, the tool reports an error instead of returning the wrong results: just run it again.
 
 ## Citing
 

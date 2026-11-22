@@ -17,8 +17,8 @@
 //   * No generic relay. Every internal API call is built here from validated integers (plus the
 //     app's own search-file token), checked by the IT-741 segment allow-list, and must match one
 //     route of a fixed list. Everything is GET, except one fixed POST route (page OCR text).
-//   * Values enter Runtime.evaluate only through JSON.stringify or Number(); search text is typed
-//     with Input.insertText (data, not code).
+//   * Values enter Runtime.evaluate only through JSON.stringify or Number(); search text is passed
+//     to Otzar's own doFreeSearch as a JSON string (data, not code) (IT-876).
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
@@ -597,6 +597,13 @@ const PAGE_HELPERS = `
   const __fsInputs = () => [...document.querySelectorAll('input[id^="fs_input_"]')];
   const __fsComp = () => { for (const i of __fsInputs()) { let e = i; while (e && !e.__vue__) e = e.parentElement; if (e && e.__vue__ && e.__vue__.freeSearchBookListStore) return e.__vue__; } return null; };
   const __fsStore = () => { const c = __fsComp(); return c && c.freeSearchBookListStore; };
+  // IT-876: the user's scope selection, read only. searchInBooks is an id array (browse folder,
+  // selection) or an object {id, <listType>: true} for a saved list chosen in the combo.
+  const __scopeBooks = (f) => { const b = f && f.searchInBooks;
+    if (Array.isArray(b)) return { count: b.length };
+    if (b && typeof b === 'object') return { list_id: b.id ?? null };
+    return null; };
+  const __scopeName = (f) => { const n = f && (f.savedListName || f.currentFsSavedList); return typeof n === 'string' && n ? n.slice(0, 200) : null; };
   const __webpackReq = () => {
     const K = Symbol.for('otzar-mcp.webpackRequire');
     let req = globalThis[K] || null;
@@ -806,9 +813,11 @@ async function coverageCheck() {
   };
   if (!ok) {
     state.coverage.warning =
-      "Search covers too few books. Otzar's search settings are probably limiting the search " +
-      "(a book list or filter is selected, or a setting is stuck). Fix the search settings in Otzar, " +
-      "or install the latest Otzar software update. Until then, search results are incomplete.";
+      // IT-876: the control search always runs on the whole library, whatever scope is selected
+      // in Otzar's search panel, so a selected book group is not the cause here.
+      "Search covers too few books, even though this tool searched the whole library. Otzar's search " +
+      "index on this PC may be incomplete, or the Otzar data disk is not the full library. Tell the user; " +
+      "installing the latest Otzar software update may help. Until then, search results are incomplete.";
   }
   return state.coverage;
 }
@@ -826,6 +835,7 @@ async function doSearch(query, limit, timeoutSec, bookIds = null) {
   const lim = Number(limit);
   const ids = bookIds && bookIds.length ? bookIds.map((x) => int(x, "book_ids", 1)) : null;
   return withSession(async (s) => {
+    let sub = null;
     const io = {
       // One evaluation reads the state and, when Otzar is idle on this query, the results too, so
       // the check and the read cannot be split by another search (IT-742 review r1, live race).
@@ -844,43 +854,82 @@ async function doSearch(query, limit, timeoutSec, bookIds = null) {
         const scope = ${JSON.stringify(ids)};
         if (scope) { const set = new Set(scope); st.results.outside_scope = list.filter((b) => !set.has(b.id)).length; }
         return st; })()`),
+      // IT-876: both kinds of search go through the component's own doFreeSearch, never through
+      // the search box, so the scope selected in Otzar's UI is never used: [] is the "whole
+      // library" list that Otzar's own getBooksToSearchIn() gives for the scope "all".
       submit: async () => {
-        if (ids) {
-          // Scoped search: the component's own method with the book ids. In Otzar's "special"
-          // search type the list is ignored (it would search the whole library), so refuse it.
-          const r = await s.evaluate(`(() => { ${PAGE_HELPERS} const c = __fsComp(); const r = __root();
-            if (!c || typeof c.doFreeSearch !== 'function') return 'nocomp';
-            if (r.$store.state.freeSearch.searchType === 'special') return 'special';
-            c.doFreeSearch(${JSON.stringify(q)}, ${JSON.stringify(ids)}); return 'ok'; })()`);
-          if (r === "special") throw new UserError("Otzar's search is set to the special search type, which cannot be limited to chosen books. Search without book_ids, or ask the user to switch Otzar back to the regular search.");
-          if (r !== "ok") throw new UserError("Otzar's search panel was not found. Make sure the main window finished loading.");
-          return;
-        }
-        // UI-driven: focus the visible content-search input, replace its text, press Enter.
-        const focused = await s.evaluate(`(() => { ${PAGE_HELPERS}
-          const i = __fsInputs().find((x) => x.offsetParent) ; if (!i) return false;
-          i.focus(); i.select(); return document.activeElement === i; })()`);
-        if (focused) {
-          await s.send("Input.insertText", { text: q });
-          for (const type of ["keyDown", "keyUp"]) await s.send("Input.dispatchKeyEvent", { type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
-        } else {
-          // The input is hidden (panel collapsed): call the search component's own search method.
-          await s.evaluate(`(() => { ${PAGE_HELPERS} const c = __fsComp(); c.doFreeSearch(${JSON.stringify(q)}); return true; })()`);
-        }
+        sub = await s.evaluate(`(${SEARCH_SUBMIT_PAGE_FN})(${JSON.stringify(q)}, ${JSON.stringify(ids)})`);
+        if (!sub || !sub.ok) throw new UserError("Otzar's search panel was not found. Make sure the main window finished loading.");
       },
       wait: sleep,
       now: Date.now,
     };
     const st = await runSearch(io, q, timeoutSec * 1000);
-    const res = st.results;
-    if (ids) {
-      const outside = res.outside_scope || 0;
-      delete res.outside_scope;
-      res.scope = { book_ids: ids, count: ids.length };
-      if (outside) res.scope_warning = `${outside} book(s) in the results are not in book_ids: Otzar did not limit this search. Treat it as a search of the whole library.`;
-    }
-    return res;
+    const after = await s.evaluate(`(() => { ${PAGE_HELPERS} const f = __fsStore(); return f ? { type: f.searchInType ?? null, books: __scopeBooks(f) } : null; })()`).catch(() => null);
+    return searchScopeReport(st.results, ids, sub, after);
   });
+}
+
+// What the page does for one search (IT-876). Read-only except for the two things Otzar's own
+// search box (doFreeSearch1) also sets before every search:
+//  - searchType: the search box sets "classic" for every scope except tsiyunim ("special"), and
+//    a leftover "special"/"mefo" would make doFreeSearch ignore the book list or search Mefo.
+//  - the doFreeSearch call itself, with [] (whole library) or the book ids.
+// The user's scope selection (freeSearchBookListStore.searchInType / searchInBooks) is only read.
+const SEARCH_SUBMIT_PAGE_FN = `(q, ids) => { ${PAGE_HELPERS}
+  const c = __fsComp(); const r = __root();
+  if (!c || typeof c.doFreeSearch !== 'function' || !r || !r.$store.state.freeSearch) return { ok: false };
+  const fs = r.$store.state.freeSearch; const f = c.freeSearchBookListStore;
+  const out = { ok: true, ui: { type: f.searchInType ?? null, books: __scopeBooks(f), name: __scopeName(f), enum: fs.enumSearchInType || null },
+                search_type_was: fs.searchType ?? null };
+  if (fs.searchType !== 'classic') fs.searchType = 'classic';
+  c.doFreeSearch(q, ids ? ids : []);
+  return out; }`;
+
+// The user's scope selection in Otzar's combo, by the numbers of freeSearch.enumSearchInType
+// (disk 19: all 1, currentList 2, selected 3, inMeforesh 4, tsiyunim 5, browse 6, custom 7 and up,
+// one per book group/list). A Mefo search sets a string "mefo_<id>".
+const SCOPE_KINDS = { all: "library", currentList: "current_list", selected: "selected_books", inMeforesh: "meforesh", tsiyunim: "tsiyunim", browse: "browse" };
+const DEFAULT_SEARCH_IN = { all: 1, currentList: 2, selected: 3, inMeforesh: 4, tsiyunim: 5, browse: 6, custom: 7 };
+function uiScopeKind(type, en) {
+  const e = en && typeof en === "object" ? en : DEFAULT_SEARCH_IN;
+  if (type == null) return "library"; // Otzar's own default when nothing was chosen yet
+  if (typeof type === "string") return /^mefo/.test(type) ? "mefo" : "other";
+  if (typeof e.custom === "number" && type >= e.custom) return "group";
+  for (const [k, name] of Object.entries(SCOPE_KINDS)) if (e[k] === type) return name;
+  return "other";
+}
+
+// Builds the scope part of a search result (IT-876). Pure, so it is tested offline.
+//  res:   the results read from the page (outside_scope only for a book_ids search)
+//  ids:   the book_ids of this call, or null
+//  sub:   SEARCH_SUBMIT_PAGE_FN's answer (the user's selection before the search)
+//  after: the user's selection read after the search, or null if it could not be read
+function searchScopeReport(res, ids, sub, after) {
+  const out = { ...res };
+  const outside = out.outside_scope || 0;
+  delete out.outside_scope;
+  out.scope = ids ? { kind: "books", book_ids: ids, count: ids.length }
+                  : { kind: "library", count: out.library_books ?? null };
+  if (ids && outside) out.scope_warning = `${outside} book(s) in the results are not in book_ids: Otzar did not limit this search. Treat it as a search of the whole library.`;
+  const ui = sub && sub.ui;
+  if (ui) {
+    const kind = uiScopeKind(ui.type, ui.enum);
+    const same = !!after && after.type === ui.type && JSON.stringify(after.books ?? null) === JSON.stringify(ui.books ?? null);
+    if (kind !== "library") {
+      const sel = { kind, ...(ui.name ? { name: ui.name } : {}), ...(ui.books || {}) };
+      sel.left_unchanged = same;
+      sel.note = "The user chose this scope in Otzar's own search panel. This tool did not use it and did not change it: " +
+        (ids ? "this search ran only in book_ids." : "this search covered the whole library.") +
+        " A search the user types in Otzar still uses that scope.";
+      out.otzar_selected_scope = sel;
+    }
+    if (after && !same) {
+      out.scope_warning = (out.scope_warning ? out.scope_warning + " " : "") +
+        "The scope selected in Otzar's search panel changed during this search; Otzar's own state may differ from what was expected.";
+    }
+  }
+  return out;
 }
 
 // Waits for the search of q that this call submits, and only for that one (IT-742 review r1):
@@ -1626,7 +1675,7 @@ const TOOLS = [
   },
   {
     name: "search",
-    description: "Full-text search in the user's Otzar HaChochma library, using Otzar's own search syntax (see the skill). With book_ids, only in those books (e.g. the volumes found with find_book). Returns the total number of results, the number of books with results, and the top books (book_id, name, volume, authors, year, results). The search runs in Otzar's search panel, so the user sees it there too, and Otzar adds it to its search history.",
+    description: "Full-text search in the user's Otzar HaChochma library, using Otzar's own search syntax (see the skill). Without book_ids it always searches the whole library, whatever scope (book group, list, selection) the user chose in Otzar's search panel; that choice is not used and not changed. With book_ids, only in those books (e.g. the volumes found with find_book). Every result has scope ({kind: library|books, count}); otzar_selected_scope appears when the user has another scope selected in Otzar. Returns the total number of results, the number of books with results, and the top books (book_id, name, volume, authors, year, results). The search runs in Otzar's search panel, so the user sees it there too, and Otzar adds it to its search history.",
     inputSchema: { type: "object", properties: {
       query: { type: "string", minLength: 1, maxLength: 300, singleLine: true, notBlank: true, description: "Search text in Otzar syntax, e.g. שבת or \"מעשה & בראשית\"." },
       book_ids: { type: "array", items: { type: "integer", minimum: 1, maximum: 999999999999 }, minItems: 1, maxItems: 200, description: "Search only in these books (1-200 ids). Omit to search the whole library." },
@@ -1953,6 +2002,6 @@ async function cli() {
 }
 
 if (isSea || require.main === module) cli();
-module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, ROUTE_GET_DATA, findInstall,
+module.exports = { validateArgs, runSearch, SEARCH_SUBMIT_PAGE_FN, searchScopeReport, uiScopeKind,checkedPath, ROUTES_GET, ROUTE_POST_OCR, ROUTE_GET_DATA, findInstall,
   findReference, listReferences, refVariants, normTitle, groupOffsets, pageSegments, planHitWindow, hitText, cmdPorts,
   shortcutPopupText, MSG_STILL_LOADING, MSG_NO_DISK, STUCK_AFTER_MS, notAnsweringError, otzarDiskState, otzarLocalDir, DISK_MARKERS, DISK_PROBE_MS, scanDrives, probeDrive, BOOK_DATA_PAGE_FN, bookDataError, FIND_BOOK_PAGE_FN, findBookError, bundleFrame, findBooksOnce, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };

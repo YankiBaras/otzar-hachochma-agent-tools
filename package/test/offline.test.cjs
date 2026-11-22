@@ -1251,3 +1251,114 @@ test("IT-834 r2: no tiny-index module in this Otzar -> searchByTxt is still trie
   assert.equal(r.index.before, "module not found");
   assert.equal(r.index.loaded_by_otzar_mcp, false);
 });
+
+// ---- IT-876: an unscoped search covers the whole library, whatever scope is selected in Otzar ----
+// A fake search panel: one fs_input_ element whose Vue component has the free-search store, the
+// scope the user chose (searchInType/searchInBooks) and a doFreeSearch that records its calls.
+const EN = { all: 1, selected: 3, inMeforesh: 4, browse: 6, currentList: 2, tsiyunim: 5, custom: 7 };
+function fakeSearchPanel({ searchInType = 1, searchInBooks = [], searchType = "classic", noComp = false, savedListName = "" } = {}) {
+  const calls = [];
+  const store = { searchInType, searchInBooks, savedListName, setBooksToSearchIn() { throw new Error("must not change the selection"); } };
+  const fs = { enumSearchInType: EN, searchType };
+  const comp = { freeSearchBookListStore: store, doFreeSearch: (...a) => { calls.push({ args: a, searchType: fs.searchType }); return Promise.resolve(); } };
+  const input = { id: "fs_input_0.1", __vue__: noComp ? undefined : comp, parentElement: null };
+  const root = { $store: { state: { freeSearch: fs }, getters: {} } };
+  const doc = { querySelector: (q) => (q === "#app" ? { __vue__: root } : null), querySelectorAll: () => [input] };
+  return { calls, store, fs, doc };
+}
+function runSubmit(panel, q, ids) {
+  globalThis.document = panel.doc;
+  try { return (0, eval)(`(${m.SEARCH_SUBMIT_PAGE_FN})`)(q, ids); } finally { delete globalThis.document; }
+}
+
+test("IT-876 submit: no book_ids -> doFreeSearch(q, []) (Otzar's whole-library list), the user's book group is read, not changed", () => {
+  const p = fakeSearchPanel({ searchInType: 6, searchInBooks: [5, 6, 7], savedListName: "משנה ברורה" });
+  const r = runSubmit(p, "שבת", null);
+  assert.equal(r.ok, true);
+  assert.deepEqual(p.calls.map((c) => c.args), [["שבת", []]]);
+  assert.deepEqual(r.ui, { type: 6, books: { count: 3 }, name: "משנה ברורה", enum: EN });
+  assert.equal(p.store.searchInType, 6);
+  assert.deepEqual(p.store.searchInBooks, [5, 6, 7]);
+  // A saved list chosen in the combo stores an object {id, <listType>: true}, not an array.
+  const p2 = fakeSearchPanel({ searchInType: 8, searchInBooks: { id: 44, free: true } });
+  const r2 = runSubmit(p2, "שבת", null);
+  assert.deepEqual(r2.ui.books, { list_id: 44 });
+  assert.equal(r2.ui.name, null);
+  assert.deepEqual(p2.store.searchInBooks, { id: 44, free: true });
+});
+
+test("IT-876 submit: book_ids -> doFreeSearch(q, ids); the selection is untouched, so nothing is left behind", () => {
+  const p = fakeSearchPanel({ searchInType: 1 });
+  runSubmit(p, "שבת", [11, 12]);
+  assert.deepEqual(p.calls.map((c) => c.args), [["שבת", [11, 12]]]);
+  assert.equal(p.store.searchInType, 1);
+  assert.deepEqual(p.store.searchInBooks, []);
+});
+
+test("IT-876 submit: a leftover special/mefo search type is set to classic first, as Otzar's search box does", () => {
+  for (const t of ["special", "mefo"]) {
+    const p = fakeSearchPanel({ searchType: t, searchInType: 5 });
+    const r = runSubmit(p, "שבת", null);
+    assert.equal(r.search_type_was, t);
+    assert.equal(p.calls[0].searchType, "classic", "doFreeSearch ran with the classic type");
+    assert.equal(p.store.searchInType, 5);
+  }
+});
+
+test("IT-876 submit: no search panel -> ok false, nothing called", () => {
+  const p = fakeSearchPanel({ noComp: true });
+  assert.deepEqual(runSubmit(p, "שבת", null), { ok: false });
+  assert.equal(p.calls.length, 0);
+});
+
+test("IT-876 uiScopeKind: Otzar's enumSearchInType numbers, groups from custom up, mefo strings", () => {
+  assert.equal(m.uiScopeKind(1, EN), "library");
+  assert.equal(m.uiScopeKind(null, EN), "library");
+  assert.equal(m.uiScopeKind(2, EN), "current_list");
+  assert.equal(m.uiScopeKind(3, EN), "selected_books");
+  assert.equal(m.uiScopeKind(4, EN), "meforesh");
+  assert.equal(m.uiScopeKind(5, EN), "tsiyunim");
+  assert.equal(m.uiScopeKind(6, EN), "browse");
+  assert.equal(m.uiScopeKind(7, EN), "group");
+  assert.equal(m.uiScopeKind(42, EN), "group");
+  assert.equal(m.uiScopeKind("mefo_12", EN), "mefo");
+  assert.equal(m.uiScopeKind(3, null), "selected_books", "falls back to disk 19's numbers");
+});
+
+const RES = { query: "שבת", total_results: 10, books_with_results: 4, library_books: 100, sort: "x", books: [] };
+test("IT-876 scope report: every unscoped result says library; a selected group is reported as not used and left unchanged", () => {
+  const plain = m.searchScopeReport(RES, null, { ok: true, ui: { type: 1, books: { count: 0 }, enum: EN } }, { type: 1, books: { count: 0 } });
+  assert.deepEqual(plain.scope, { kind: "library", count: 100 });
+  assert.equal(plain.otzar_selected_scope, undefined);
+  assert.equal(plain.scope_warning, undefined);
+
+  const grp = m.searchScopeReport(RES, null, { ok: true, ui: { type: 6, books: { count: 3 }, name: "תלמוד בבלי", enum: EN } }, { type: 6, books: { count: 3 } });
+  assert.deepEqual(grp.scope, { kind: "library", count: 100 });
+  assert.equal(grp.otzar_selected_scope.kind, "browse");
+  assert.equal(grp.otzar_selected_scope.name, "תלמוד בבלי");
+  assert.equal(grp.otzar_selected_scope.count, 3);
+  assert.equal(grp.otzar_selected_scope.left_unchanged, true);
+  assert.match(grp.otzar_selected_scope.note, /covered the whole library/);
+  assert.equal(grp.scope_warning, undefined);
+});
+
+test("IT-876 scope report: book_ids -> kind books; books outside book_ids still warn; a changed selection warns", () => {
+  const r = m.searchScopeReport({ ...RES, outside_scope: 2 }, [5, 6], { ok: true, ui: { type: 1, books: { count: 0 }, enum: EN } }, { type: 1, books: { count: 0 } });
+  assert.deepEqual(r.scope, { kind: "books", book_ids: [5, 6], count: 2 });
+  assert.equal("outside_scope" in r, false);
+  assert.match(r.scope_warning, /2 book\(s\) in the results are not in book_ids/);
+
+  const ch = m.searchScopeReport(RES, null, { ok: true, ui: { type: 3, books: { count: 2 }, enum: EN } }, { type: 1, books: { count: 0 } });
+  const lst = m.searchScopeReport(RES, null, { ok: true, ui: { type: 8, books: { list_id: 44 }, enum: EN } }, { type: 8, books: { list_id: 44 } });
+  assert.deepEqual([lst.otzar_selected_scope.kind, lst.otzar_selected_scope.list_id, lst.otzar_selected_scope.left_unchanged], ["group", 44, true]);
+  assert.equal(ch.otzar_selected_scope.left_unchanged, false);
+  assert.match(ch.scope_warning, /changed during this search/);
+});
+
+test("IT-876 doSearch never types into Otzar's search box (that would use the scope selected in the UI)", () => {
+  const src = require("node:fs").readFileSync(require.resolve("../src/otzar-mcp.cjs"), "utf8");
+  const body = src.slice(src.indexOf("async function doSearch("), src.indexOf("async function runSearch("));
+  assert.ok(body.length > 100);
+  assert.doesNotMatch(body, /Input\.insertText|dispatchKeyEvent|focus\(\)/);
+  assert.match(body, /SEARCH_SUBMIT_PAGE_FN/);
+});
