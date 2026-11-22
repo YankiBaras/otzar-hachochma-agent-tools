@@ -1231,17 +1231,114 @@ const BOOK_PREFIX_RE = /^(?:שו["״']?ת|ספר)\s+/;
 // searchByTxt writes tsiyunSearch and hiddenBooks into the state it gets, so the real
 // store.state.bookList is never passed. It runs in memory on Otzar's book index: no API call,
 // no UI change, no history. Never falls back to bookList/setSearchTo (that filters the user's list).
-async function findBooksOnce(s, text, limit) {
-  const r = await s.evaluate(`(() => { ${PAGE_HELPERS}
-    const f = __exportFn('searchByTxt'); const root = __root();
-    if (!f || !root || !root.$store) return { missing: true };
-    const real = root.$store.state.bookList || {};
-    let cfg = real.searchResultConfig;
-    try { cfg = JSON.parse(JSON.stringify(cfg)); } catch {}
-    const tmp = { searchResultConfig: cfg };
-    const res = f(${JSON.stringify(text)}, true, tmp) || [];
+//
+// IT-834: on disk 24 searchByTxt failed with "Cannot read properties of undefined (reading
+// 'forEach')". The cause is the book-name index (round 2, below). As a safeguard for Otzar
+// versions that read more of the state, the throwaway state is a copy-on-read Proxy over an empty
+// object: the first read of a field deep-copies that field of the real bookList state (structured
+// clone, else a JSON copy) into the throwaway object, and every later read and write uses the copy.
+// So every field Otzar may read is there, nested writes land in copies, and only the fields really
+// read are copied (on disks 19/21 that is still only searchResultConfig: as fast as before). A
+// write never reaches the real state: the set/define/delete traps act on the throwaway target only.
+// Every read is recorded (field, present in the real state or not), and an exception is caught
+// here and returned as data, so findBooksOnce() can give a clear error and "doctor --find-book"
+// can show what is missing. With diag=true the page also returns searchByTxt's source length and
+// head, the bundle file, and the bundle text around the failing position (read-only).
+//
+// IT-834 round 2: the disk-24 failure is not in the state. searchByTxt calls searchTinyIndex,
+// which walks the module-level book-name index (inxData). That variable starts as {} and is
+// filled only by Otzar's action books/loadIndexData(true), which Otzar's own F2 input dispatches
+// on focus (mixin "78ba": loadIndex). Until then searchTinyIndex hits ({}).strings.forEach: the
+// pilot's "Cannot read properties of undefined (reading 'forEach')". So, like F2, the page first
+// probes the index (read-only: searchTinyIndex with one word that matches nothing and is marked
+// matchWordComplete, so it only scans the word list); if the index is not loaded it dispatches
+// books/loadIndexData(true), exactly what F2 does on focus, probes again, and only then calls
+// searchByTxt. loadIndexData reads Otzar's own cache, or rebuilds it from api/books/index when
+// it is stale, as F2 does; it commits nothing to the store (no list, search, history or screen
+// change). The index stays in memory afterwards, as after any F2 use (F2's blur action is empty).
+const FIND_BOOK_PAGE_FN = `async (text, limit, diag) => {
+  ${PAGE_HELPERS}
+  const f = __exportFn('searchByTxt'); const root = __root();
+  if (!f || !root || !root.$store) return { missing: true };
+  const real = root.$store.state.bookList || {};
+  // The tiny-index module: its default export has createTinyIndex + searchTinyIndex.
+  const tinyIndex = (() => {
+    const req = __webpackReq(); if (!req) return null;
+    const k = Object.keys(req.c).find((k) => { const d = req.c[k] && req.c[k].exports && req.c[k].exports.default; return d && typeof d.searchTinyIndex === 'function' && typeof d.createTinyIndex === 'function'; });
+    return k ? req.c[k].exports.default : null;
+  })();
+  let cfgCopy = {}; try { cfgCopy = JSON.parse(JSON.stringify(real.searchResultConfig || {})); } catch {}
+  // The probe word counts how often searchTinyIndex reads it after lower-casing it: once per
+  // entry of the index's word list (strings), so the length is known without reading any entry.
+  let stringsLength = null;
+  const probe = () => {
+    if (!tinyIndex) return 'module not found';
+    let v = '\\u0001otzar-mcp-probe', lowered = false, reads = 0;
+    const w = { wordAt: 0, inCol: [], mainWord: true, matchWordComplete: true };
+    Object.defineProperty(w, 'word', { enumerable: true, get: () => { if (lowered) reads++; return v; }, set: (x) => { v = x; lowered = true; } });
+    try {
+      tinyIndex.searchTinyIndex([w], cfgCopy);
+      stringsLength = lowered ? reads : null;
+      return 'loaded';
+    } catch (e) {
+      const m = String(e && e.message || e);
+      if (/reading 'forEach'/.test(m)) return 'not loaded (strings missing)';
+      if (/reading '(buffer|strings)'/.test(m)) return 'not loaded (null)';
+      return 'error: ' + m.slice(0, 120);
+    }
+  };
+  const index = { before: probe(), loaded_by_otzar_mcp: false, otzar_version: (() => { try { return root.$store.state.otzar_version ?? null; } catch { return null; } })() };
+  if (/^not loaded/.test(index.before)) {
+    try { await root.$store.dispatch('books/loadIndexData', true); index.loaded_by_otzar_mcp = true; }
+    catch (e) { index.load_error = String(e && e.message || e).slice(0, 200); }
+    index.after = probe();
+  }
+  const indexNow = index.after || index.before;
+  index.strings_length = indexNow === 'loaded' ? stringsLength : null;
+  const reads = {}; const writes = [];
+  const copyOf = (v) => {
+    if (v === null || typeof v !== 'object') return typeof v === 'function' ? undefined : v;
+    try { return structuredClone(v); } catch {}
+    try { return JSON.parse(JSON.stringify(v)); } catch {}
+    return undefined;
+  };
+  const target = {};
+  const own = (k) => Object.prototype.hasOwnProperty.call(target, k);
+  const fill = (k) => {
+    if (typeof k !== 'string' || own(k)) return;
+    const present = k in real;
+    const v = present ? copyOf(real[k]) : undefined;
+    reads[k] = present ? (v === undefined && real[k] !== undefined ? 'not copyable' : 'copied') : 'missing';
+    if (present) target[k] = v;
+  };
+  const tmp = new Proxy(target, {
+    get: (t, k) => { fill(k); return t[k]; },
+    has: (t, k) => { fill(k); return k in t; },
+    getOwnPropertyDescriptor: (t, k) => { fill(k); return Object.getOwnPropertyDescriptor(t, k); },
+    ownKeys: (t) => { Object.keys(real).forEach(fill); return Reflect.ownKeys(t); },
+    set: (t, k, v) => { if (typeof k === 'string' && !own(k)) { writes.push(k); if (!(k in reads)) reads[k] = 'written first'; } t[k] = v; return true; },
+    defineProperty: (t, k, d) => { if (typeof k === 'string') writes.push(k); return Reflect.defineProperty(t, k, d); },
+    deleteProperty: (t, k) => Reflect.deleteProperty(t, k),
+  });
+  const info = () => {
+    const o = { index, state_reads: reads, state_writes: [...new Set(writes)], real_state_fields: Object.keys(real) };
+    if (!diag) return o;
+    try { const src = String(__exportsWith(['searchByTxt']).searchByTxt); o.search_fn_length = src.length; o.search_fn_head = src.slice(0, 300); } catch (e) { o.search_fn_error = String(e && e.message || e).slice(0, 120); }
+    try { o.scripts = [...document.querySelectorAll('script[src]')].map((x) => String(x.src).split('/').pop()).slice(0, 20); } catch {}
+    try { const lic = root.$store.state.offline.licence; o.otzar_disk_version = lic.otzarVer ?? null; o.otzar_update_version = lic.updatesVer ?? null; } catch {}
+    return o;
+  };
+  // The index is still not usable: searchByTxt would only throw on it.
+  if (/^(not loaded|error)/.test(indexNow)) return { failed: true, stage: 'index', error: { name: 'Error', message: "Otzar's book-name index is " + indexNow, stack: [] }, ...info() };
+  let res;
+  try { res = f(text, true, tmp); }
+  catch (e) {
+    const stack = String(e && e.stack || '').split('\\n').slice(0, 10).map((l) => l.trim().slice(0, 300));
+    return { failed: true, error: { name: String(e && e.name || 'Error'), message: String(e && e.message || e).slice(0, 300), stack }, ...info() };
+  }
+  try {
     const list = Array.isArray(res) ? res : [];
-    const books = list.slice(0, ${int(limit, "limit", 1, 200)}).map((x) => {
+    const books = list.slice(0, limit).map((x) => {
       const b = (x && x.book) || x || {};
       const authors = []; for (let i = 0; i < (b.authors_length || 0); i++) if (b['authors_' + i + '_name']) authors.push(b['authors_' + i + '_name']);
       const vols = Number(b.volumes_length) || 0;
@@ -1254,10 +1351,86 @@ async function findBooksOnce(s, text, limit) {
         authors: authors.length ? authors : undefined, place: b.places || undefined,
         year: b.fromyear ? (b.toyear && b.toyear !== b.fromyear ? b.fromyear + '-' + b.toyear : b.fromyear) : undefined };
     });
-    return { total: list.length, hidden: Number(tmp.hiddenBooks) || 0, ref: typeof tmp.tsiyunSearch === 'string' ? tmp.tsiyunSearch : '', books };
-  })()`);
+    // Read from the throwaway target itself: a read through the Proxy would copy the real field.
+    return { total: list.length, hidden: Number(target.hiddenBooks) || 0, ref: typeof target.tsiyunSearch === 'string' ? target.tsiyunSearch : '', books, ...(diag ? info() : {}) };
+  } catch (e) {
+    return { failed: true, stage: 'result', error: { name: String(e && e.name || 'Error'), message: String(e && e.message || e).slice(0, 300), stack: String(e && e.stack || '').split('\\n').slice(0, 10).map((l) => l.trim().slice(0, 300)) }, ...info() };
+  }
+}`;
+
+// The clear error for a failed book-name search (IT-834). Names the JS error, the state fields
+// searchByTxt read that the real state does not have, and the way around it.
+function findBookError(r) {
+  const err = r && r.error ? `${r.error.name}: ${r.error.message}` : "unknown error";
+  const missing = Object.entries((r && r.state_reads) || {}).filter(([, v]) => v === "missing" || v === "not copyable").map(([k, v]) => `${k} (${v})`);
+  const where = r && r.stage === "result" ? "Reading the result of Otzar's book-name search failed" : "Otzar's book-name search failed in this Otzar version";
+  // IT-834 round 2: the state of Otzar's book-name index (inxData), before and after Otzar's own
+  // loadIndexData, so the message names the index and not only book-list fields.
+  const ix = r && r.index;
+  const ixText = ix ? `; book-name index: ${ix.before}` + (ix.loaded_by_otzar_mcp || ix.load_error ? `, after Otzar's loadIndexData: ${ix.after}${ix.load_error ? ` (load error: ${ix.load_error})` : ""}` : "") + `, otzar_version ${ix.otzar_version ?? "unknown"}` : "";
+  return new UserError(
+    `${where} (${err})` + ixText +
+    (missing.length ? `; state fields it needed that are not in Otzar's book list: ${missing.join(", ")}` : "") +
+    ". find_book cannot be used on this PC until otzar-mcp is updated: use search with the book's name instead. " +
+    "Tell the user to send this message, or the output of: otzar-mcp.exe doctor --find-book \"<book name>\", to the otzar-mcp developer.",
+    "find_book_failed");
+}
+
+async function findBooksOnce(s, text, limit, diag = false) {
+  let r;
+  // 90 s: the first call may wait for Otzar's own loadIndexData (it rebuilds a stale index).
+  try { r = await s.evaluate(`(${FIND_BOOK_PAGE_FN})(${JSON.stringify(text)}, ${int(limit, "limit", 1, 200)}, ${diag ? "true" : "false"})`, 90_000); }
+  catch (e) {
+    // A lost CDP connection stays as it is (errorText() turns it into "Otzar was closed").
+    if (/^CDP /.test(e.message)) throw e;
+    throw findBookError({ error: { name: "Error", message: String(e.message).slice(0, 300) } });
+  }
   if (!r || r.missing) throw new UserError("Otzar's book-name search was not found in this Otzar version. Update otzar-mcp, or use search with the book's name.");
+  if (r.failed && !diag) throw findBookError(r);
   return r;
+}
+
+// "otzar-mcp.exe doctor --find-book <name>" (IT-834): runs exactly the find_book call and prints
+// the result or the error with its stack, the state of Otzar's book-name index (before and after
+// Otzar's own loadIndexData, which F2 also runs; its word count, never a word), the otzar_version
+// searchTinyIndex reads, the state fields searchByTxt read (and which of them the real state
+// lacks), searchByTxt's source length and head, and the bundle text around the failing position.
+// It writes nothing itself. Prints book names only, never a book's text.
+async function findBookCheck(query) {
+  const q = String(query ?? "").trim();
+  if (!q) throw new UserError('usage: otzar-mcp doctor --find-book "<book name>"');
+  return withSession(async (s) => {
+    const r = await findBooksOnce(s, q, 5, true);
+    const out = { query: q, ok: !r.failed };
+    if (r.failed) {
+      Object.assign(out, { stage: r.stage || "search", error: r.error });
+      const frame = bundleFrame(r.error && r.error.stack);
+      if (frame) {
+        out.failing_position = frame;
+        try {
+          out.bundle_excerpt = await s.evaluate(`(async () => { const t = await (await fetch(${JSON.stringify(frame.url)})).text();
+            const lines = t.split('\\n'); const l = lines[${frame.line - 1}] || ''; const c = ${frame.column - 1};
+            return l.slice(Math.max(0, c - 400), c + 400); })()`, 15_000);
+        } catch (e) { out.bundle_excerpt_error = String(e.message).slice(0, 120); }
+      }
+    } else {
+      Object.assign(out, { total_matches: r.total, first_books: r.books.map((b) => ({ book_id: b.book_id, name: b.name, volume: b.volume })) });
+    }
+    for (const k of ["index", "state_reads", "state_writes", "real_state_fields", "search_fn_length", "search_fn_head", "search_fn_error", "scripts", "otzar_disk_version", "otzar_update_version"]) {
+      if (r[k] !== undefined) out[k] = r[k];
+    }
+    return out;
+  });
+}
+
+// The first stack frame inside Otzar's own script bundle: "at H (file:///.../app.3b803a52.js:1:2480200)".
+// Only a .js file of the page itself (file:, app: or http(s)://localhost) is accepted.
+function bundleFrame(stack) {
+  for (const l of Array.isArray(stack) ? stack : []) {
+    const m = /\(?((?:file|app):\/\/[^\s()]+?\.js|https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?\/[^\s()]+?\.js):(\d+):(\d+)\)?\s*$/.exec(l);
+    if (m) return { url: m[1], line: Number(m[2]), column: Number(m[3]), file: m[1].split("/").pop() };
+  }
+  return null;
 }
 
 async function toolFindBook(args) {
@@ -1765,6 +1938,8 @@ async function cli() {
         : await toolStatus({ coverage_check: process.argv.includes("--coverage") });
       if (cmd === "doctor") r.disk = await deps.diskState(state.install || { exe: r.install });
       if (cmd === "doctor" && bi > 0) r.index_check = await indexCheck(int(process.argv[bi + 1], "--book", 1));
+      const fi = process.argv.indexOf("--find-book");
+      if (cmd === "doctor" && fi > 0) r.find_book_check = await findBookCheck(process.argv[fi + 1]);
       if (state.warnings.size) r.warnings = [...state.warnings];
       process.stdout.write(JSON.stringify(r, null, 1) + "\n");
       process.exit(0);
@@ -1773,11 +1948,11 @@ async function cli() {
       process.exit(e instanceof UserError ? 2 : 1);
     }
   }
-  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage] [--book <id>] | shortcut]\n");
+  process.stderr.write("usage: otzar-mcp [serve | launch | doctor [--coverage] [--book <id>] [--find-book <name>] | shortcut]\n");
   process.exit(64);
 }
 
 if (isSea || require.main === module) cli();
 module.exports = { validateArgs, runSearch, checkedPath, ROUTES_GET, ROUTE_POST_OCR, ROUTE_GET_DATA, findInstall,
   findReference, listReferences, refVariants, normTitle, groupOffsets, pageSegments, planHitWindow, hitText, cmdPorts,
-  shortcutPopupText, MSG_STILL_LOADING, MSG_NO_DISK, STUCK_AFTER_MS, notAnsweringError, otzarDiskState, otzarLocalDir, DISK_MARKERS, DISK_PROBE_MS, scanDrives, probeDrive, BOOK_DATA_PAGE_FN, bookDataError, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };
+  shortcutPopupText, MSG_STILL_LOADING, MSG_NO_DISK, STUCK_AFTER_MS, notAnsweringError, otzarDiskState, otzarLocalDir, DISK_MARKERS, DISK_PROBE_MS, scanDrives, probeDrive, BOOK_DATA_PAGE_FN, bookDataError, FIND_BOOK_PAGE_FN, findBookError, bundleFrame, findBooksOnce, POPUP_TIMEOUT_MS, BOOK_PREFIX_RE, startLockName, tryLock, otzarProcesses, cdpVersion, ensureOtzar, deps, state, TOOLS, callTool, errorText, makeShortcut, launchFromShortcut, SHORTCUT_NAME, SHORTCUT_ARGS, START_CAP, START_WINDOW_MS, MSG_ALREADY_OPEN, UserError };

@@ -995,3 +995,259 @@ test("IT-788: the starter answers but there is no main window and no disk -> 'co
     assert.match(r2.content[0].text, /still loading/);
   } finally { m.state.port = null; await closeSrv(starter); }
 });
+
+// ---------------------------------------------------------------------------------------------
+// IT-834: find_book on disk 24. The page function of findBooksOnce() runs here in Node against a
+// fake Vue root (document #app) and a fake webpack module that exports searchByTxt. The fake
+// searchByTxt plays the disk 19 behaviour (reads searchResultConfig, writes tsiyunSearch and
+// hiddenBooks) and the disk 24 cases (reads more fields, writes into nested ones, or reads a field
+// the state does not have).
+// ---------------------------------------------------------------------------------------------
+const BOOK = (id, name, extra = {}) => ({ id, name, mainVolume: id, volumes_length: 1, authors_length: 1, authors_0_name: "מחבר", _show: true, ...extra });
+function realBookList() {
+  // Like Vue 2 state: reactive getters/setters, a non-enumerable __ob__, nested objects and arrays.
+  const st = {};
+  const fields = {
+    searchResultConfig: { full_points: 1, levinMin: 0.8, score: { name: { score: 25, bit: 1 } } },
+    hiddenBooks: 7,
+    tsiyunSearch: "",
+    systemBasicBooksIds: [1, 2, 3],
+    historyUsersActions: { current: 1, data: [{ type: "ALL", content: "" }] },
+  };
+  for (const [k, v] of Object.entries(fields)) {
+    let val = v;
+    Object.defineProperty(st, k, { enumerable: true, configurable: true, get: () => val, set: (x) => { val = x; } });
+  }
+  Object.defineProperty(st, "__ob__", { enumerable: false, value: { dep: { subs: [() => {}] } } });
+  return st;
+}
+// A fake of Otzar's tiny-index module (update 7.40001, module default export): searchTinyIndex
+// walks the module-level index `d`, which starts as {} (as in Otzar: "var d={}") and is filled by
+// the store action books/loadIndexData(true), the one Otzar's F2 input dispatches on focus.
+function fakeTinyIndex({ loaded = true, loadFixes = true } = {}) {
+  const ix = { d: loaded ? { buffer: new ArrayBuffer(8), strings: ["משנה", "ברורה", "אגרות"] } : {}, dispatches: [] };
+  ix.module = { exports: { default: {
+    createTinyIndex: () => {},
+    searchTinyIndex: (words, cfg = {}) => {
+      const n = ix.d; new Int32Array(n.buffer); // like Otzar: null -> "reading 'buffer'"
+      words.forEach((e) => { e.word = e.word.toLowerCase(); n.strings.forEach((s) => { s.indexOf(e.word); if (e.matchWordComplete) return; }); });
+      return [];
+    },
+    inxData: {},
+  } } };
+  ix.dispatch = async (name, arg) => {
+    ix.dispatches.push([name, arg]);
+    if (name === "books/loadIndexData" && arg === true && loadFixes) ix.d = { buffer: new ArrayBuffer(8), strings: ["משנה", "ברורה", "אגרות"] };
+  };
+  return ix;
+}
+async function withFakePage(searchByTxt, bookList, fn, ix = fakeTinyIndex()) {
+  fakeReq.c.bookListModule = { exports: { searchByTxt } };
+  if (ix) fakeReq.c.tinyIndexModule = ix.module;
+  const root = { $store: { state: { bookList, otzar_version: 24, offline: { licence: { otzarVer: 24, updatesVer: "7.40001" } } },
+    dispatch: ix ? ix.dispatch : async () => {} } };
+  globalThis.document = { querySelector: (q) => (q === "#app" ? { __vue__: root } : null), querySelectorAll: () => [] };
+  try { return await fn(); } finally { delete globalThis.document; delete fakeReq.c.bookListModule; delete fakeReq.c.tinyIndexModule; }
+}
+async function runFindPage(searchByTxt, { text = "משנה ברורה", limit = 20, diag = false, bookList = realBookList(), ix } = {}) {
+  const before = JSON.stringify(bookList);
+  const r = await withFakePage(searchByTxt, bookList, () => (0, eval)(`(${m.FIND_BOOK_PAGE_FN})`)(text, limit, diag), ix);
+  return { r, before, after: JSON.stringify(bookList), bookList };
+}
+// Disk 19/21: what searchByTxt does with the state it gets.
+function searchV19(text, special, n) {
+  assert.equal(n.searchResultConfig.levinMin, 0.8);
+  n.tsiyunSearch = text.split("  ")[1] || "";
+  n.hiddenBooks = 0;
+  n.hiddenBooks++;
+  return [{ id: 0, special: true, allVolumes: false, book: BOOK(25882, "משנה ברורה") }];
+}
+
+test("IT-834 find_book page: disk 19 behaviour still works, only searchResultConfig is copied, the real state is unchanged", async () => {
+  const { r, before, after } = await runFindPage(searchV19, { text: "משנה ברורה  סימן א", diag: true });
+  assert.equal(r.failed, undefined);
+  assert.equal(r.total, 1);
+  assert.equal(r.books[0].book_id, 25882);
+  assert.equal(r.hidden, 1);
+  assert.equal(r.ref, "סימן א");
+  assert.deepEqual(r.state_reads, { searchResultConfig: "copied", tsiyunSearch: "written first", hiddenBooks: "written first" });
+  assert.equal(after, before, "the real bookList state did not change");
+});
+
+test("IT-834 find_book page: a field read on disk 24 is there (copied), and writes into nested objects/arrays never reach the real state", async () => {
+  const v24 = (text, special, n) => {
+    n.systemBasicBooksIds.forEach(() => {});
+    n.systemBasicBooksIds.push(99);
+    n.searchResultConfig.score.name.score = 0;
+    n.historyUsersActions.data[0].content = "changed";
+    n.historyUsersActions = null;
+    delete n.tsiyunSearch;
+    Object.defineProperty(n, "extra", { value: 1, configurable: true });
+    n.hiddenBooks = 0;
+    return [{ id: 0, special: true, book: BOOK(1, "א") }];
+  };
+  const { r, before, after, bookList } = await runFindPage(v24, { diag: true });
+  assert.equal(r.failed, undefined, JSON.stringify(r.error));
+  assert.equal(r.total, 1);
+  assert.equal(after, before, "the real bookList state did not change");
+  assert.deepEqual(bookList.systemBasicBooksIds, [1, 2, 3]);
+  assert.equal(bookList.searchResultConfig.score.name.score, 25);
+  assert.equal(bookList.historyUsersActions.data[0].content, "");
+  assert.equal(bookList.tsiyunSearch, "");
+  assert.equal("extra" in bookList, false);
+  assert.equal(r.state_reads.systemBasicBooksIds, "copied");
+  assert.equal(r.state_reads.searchResultConfig, "copied");
+  assert.equal(r.state_reads.hiddenBooks, "written first", "a field only written is never copied");
+  assert.equal(r.otzar_disk_version, 24);
+});
+
+test("IT-834 find_book page: enumerating the state ({...n}) sees every real field, as copies", async () => {
+  const spread = (text, special, n) => { const c = { ...n }; c.systemBasicBooksIds.push(5); assert.ok("historyUsersActions" in n); return []; };
+  const { r, before, after } = await runFindPage(spread);
+  assert.equal(r.failed, undefined, JSON.stringify(r.error));
+  assert.equal(r.total, 0);
+  assert.equal(after, before);
+});
+
+test("IT-834 find_book page: a field missing from the state gives the error as data, with the missing field, never a throw", async () => {
+  const v24missing = (text, special, n) => { n.searchResultConfig; n.newDisk24List.forEach(() => {}); return []; };
+  const { r, before, after } = await runFindPage(v24missing, { diag: true });
+  assert.equal(r.failed, true);
+  assert.equal(r.error.name, "TypeError");
+  assert.match(r.error.message, /reading 'forEach'/);
+  assert.ok(Array.isArray(r.error.stack) && r.error.stack.length > 0);
+  assert.equal(r.state_reads.newDisk24List, "missing");
+  assert.equal(r.state_reads.searchResultConfig, "copied");
+  assert.ok(r.real_state_fields.includes("searchResultConfig"));
+  assert.ok(r.search_fn_length > 0);
+  assert.equal(after, before);
+});
+
+test("IT-834 find_book page: a function in the state is not handed over; reading the result is guarded too", async () => {
+  const bookList = realBookList();
+  bookList.fn = () => "real";
+  const usesFn = (text, special, n) => { assert.equal(n.fn, undefined); return [null]; };
+  const { r } = await runFindPage(usesFn, { bookList, diag: true });
+  assert.equal(r.failed, true);
+  assert.equal(r.stage, "result");
+  assert.equal(r.state_reads.fn, "not copyable");
+});
+
+test("IT-834 findBookError: a plain message with the JS error, the missing fields and the way around it", () => {
+  const e = m.findBookError({ error: { name: "TypeError", message: "Cannot read properties of undefined (reading 'forEach')" },
+    state_reads: { searchResultConfig: "copied", newDisk24List: "missing" } });
+  assert.ok(e instanceof m.UserError);
+  assert.equal(e.code, "find_book_failed");
+  assert.match(e.message, /^Otzar's book-name search failed in this Otzar version \(TypeError: Cannot read properties of undefined \(reading 'forEach'\)\)/);
+  assert.match(e.message, /state fields it needed that are not in Otzar's book list: newDisk24List \(missing\)/);
+  assert.doesNotMatch(e.message, /searchResultConfig/);
+  assert.match(e.message, /use search with the book's name instead/);
+  assert.match(e.message, /doctor --find-book/);
+  const e2 = m.findBookError({ error: { name: "TypeError", message: "x" }, state_reads: {} });
+  assert.doesNotMatch(e2.message, /state fields/);
+});
+
+test("IT-834 findBooksOnce: a failed search is a UserError; a lost CDP connection stays a CDP error; diag returns the data", async () => {
+  const sess = (fn) => ({ evaluate: async (expr) => withFakePage(fn, realBookList(), () => (0, eval)(expr)) });
+  const bad = (t, s, n) => n.nothing.forEach(() => {});
+  await assert.rejects(m.findBooksOnce(sess(bad), "משנה ברורה", 20), (e) => e instanceof m.UserError && e.code === "find_book_failed" && /nothing \(missing\)/.test(e.message));
+  const d = await m.findBooksOnce(sess(bad), "משנה ברורה", 5, true);
+  assert.equal(d.failed, true);
+  const ok = await m.findBooksOnce(sess(searchV19), "משנה ברורה", 20);
+  assert.equal(ok.books[0].name, "משנה ברורה");
+  await assert.rejects(m.findBooksOnce({ evaluate: async () => { throw new Error("CDP connection closed"); } }, "x", 1), (e) => !(e instanceof m.UserError) && e.message === "CDP connection closed");
+  await assert.rejects(m.findBooksOnce({ evaluate: async () => { throw new Error("TypeError: boom"); } }, "x", 1), (e) => e.code === "find_book_failed" && /book-name search failed/.test(e.message));
+  await assert.rejects(m.findBooksOnce({ evaluate: async () => ({ missing: true }) }, "x", 1), /was not found in this Otzar version/);
+});
+
+test("IT-834 bundleFrame: finds the first frame in Otzar's own bundle, ignores others", () => {
+  assert.deepEqual(m.bundleFrame([
+    "TypeError: Cannot read properties of undefined (reading 'forEach')",
+    "at eval (eval at <anonymous>, <anonymous>:3:5)",
+    "at H (file:///C:/otzarApp/OtzarLocal/launcher/bin/x64/dist/js/app.3b803a52.js:1:2480200)",
+  ]), { url: "file:///C:/otzarApp/OtzarLocal/launcher/bin/x64/dist/js/app.3b803a52.js", line: 1, column: 2480200, file: "app.3b803a52.js" });
+  assert.equal(m.bundleFrame(["at H (https://evil.example/app.js:1:2)"]), null);
+  assert.equal(m.bundleFrame(undefined), null);
+  assert.equal(m.bundleFrame(["at w (app://./js/app.1.js:1:20)"]).column, 20);
+});
+
+// IT-834 round 2: the book-name index. The fake searchByTxt is shaped like Otzar's H: it reads only
+// searchResultConfig and calls the tiny-index module's searchTinyIndex, which walks the index.
+function searchLikeH(ix) {
+  const calls = { n: 0 };
+  const fn = (text, special, n) => {
+    calls.n++;
+    const cfg = n.searchResultConfig;
+    ix.module.exports.default.searchTinyIndex([{ word: text.split(" ")[0], wordAt: 0, inCol: [], mainWord: true }], cfg);
+    n.tsiyunSearch = ""; n.hiddenBooks = 0;
+    return [{ id: 0, special: true, book: BOOK(25882, "משנה ברורה") }];
+  };
+  return { fn, calls };
+}
+
+test("IT-834 r2: index not loaded ({} as at Otzar start) -> Otzar's own loadIndexData(true), as F2 does, then the search works", async () => {
+  const ix = fakeTinyIndex({ loaded: false });
+  const h = searchLikeH(ix);
+  const { r, before, after } = await runFindPage(h.fn, { ix, diag: true });
+  assert.equal(r.failed, undefined, JSON.stringify(r.error));
+  assert.equal(r.books[0].book_id, 25882);
+  assert.deepEqual(ix.dispatches, [["books/loadIndexData", true]]);
+  assert.equal(r.index.before, "not loaded (strings missing)");
+  assert.equal(r.index.after, "loaded");
+  assert.equal(r.index.loaded_by_otzar_mcp, true);
+  assert.equal(r.index.strings_length, 3, "counted by the probe, no word read back");
+  assert.equal(r.index.otzar_version, 24);
+  assert.equal(h.calls.n, 1);
+  assert.equal(after, before, "the real bookList state did not change");
+});
+
+test("IT-834 r2: index already loaded -> no dispatch at all; null index (freed) is also loaded the F2 way", async () => {
+  const ix = fakeTinyIndex();
+  const { r } = await runFindPage(searchLikeH(ix).fn, { ix, diag: true });
+  assert.equal(r.failed, undefined);
+  assert.deepEqual(ix.dispatches, []);
+  assert.deepEqual([r.index.before, r.index.after, r.index.strings_length], ["loaded", undefined, 3]);
+  const ix2 = fakeTinyIndex(); ix2.d = null;
+  const { r: r2 } = await runFindPage(searchLikeH(ix2).fn, { ix: ix2, diag: true });
+  assert.equal(r2.failed, undefined);
+  assert.equal(r2.index.before, "not loaded (null)");
+  assert.equal(r2.index.after, "loaded");
+});
+
+test("IT-834 r2 (review item 4): searchByTxt reads only searchResultConfig and throws reading 'forEach' -> the error and the doctor payload name the index", async () => {
+  // a) the index cannot be loaded: searchByTxt is not even called; the index is named.
+  const ix = fakeTinyIndex({ loaded: false, loadFixes: false });
+  let called = 0;
+  const thrower = (t, s, n) => { called++; n.searchResultConfig; const d = {}; return d.strings.forEach(() => {}); };
+  const sess = (fn, ixx) => ({ evaluate: async (expr) => withFakePage(fn, realBookList(), () => (0, eval)(expr), ixx) });
+  const bookList = realBookList();
+  const { r, before, after } = await runFindPage(thrower, { ix, diag: true, bookList });
+  assert.equal(r.failed, true);
+  assert.equal(r.stage, "index");
+  assert.equal(called, 0);
+  assert.deepEqual(r.index, { before: "not loaded (strings missing)", loaded_by_otzar_mcp: true, otzar_version: 24, after: "not loaded (strings missing)", strings_length: null });
+  assert.equal(Object.values(r.state_reads).includes("missing"), false, "no book-list field is blamed");
+  assert.equal(after, before, "the real bookList state did not change");
+  await assert.rejects(m.findBooksOnce(sess(thrower, fakeTinyIndex({ loaded: false, loadFixes: false })), "משנה ברורה", 20), (e) => {
+    assert.equal(e.code, "find_book_failed");
+    assert.match(e.message, /book-name index: not loaded \(strings missing\), after Otzar's loadIndexData: not loaded \(strings missing\), otzar_version 24/);
+    assert.doesNotMatch(e.message, /state fields/);
+    assert.match(e.message, /use search with the book's name instead/);
+    return true;
+  });
+  // b) the probe finds the index loaded, but searchByTxt still throws the same TypeError: the
+  //    error is the real one, and it still reports the index (loaded, its word count).
+  const ix3 = fakeTinyIndex();
+  const r3 = await m.findBooksOnce(sess(thrower, ix3), "משנה ברורה", 5, true);
+  assert.equal(r3.failed, true);
+  assert.match(r3.error.message, /reading 'forEach'/);
+  assert.deepEqual([r3.index.before, r3.index.strings_length], ["loaded", 3]);
+  await assert.rejects(m.findBooksOnce(sess(thrower, fakeTinyIndex()), "משנה ברורה", 20), /\(TypeError: Cannot read properties of undefined \(reading 'forEach'\)\); book-name index: loaded, otzar_version 24\. find_book cannot/);
+});
+
+test("IT-834 r2: no tiny-index module in this Otzar -> searchByTxt is still tried, and the index is reported as 'module not found'", async () => {
+  const { r } = await runFindPage(searchV19, { ix: null, diag: true });
+  assert.equal(r.failed, undefined);
+  assert.equal(r.index.before, "module not found");
+  assert.equal(r.index.loaded_by_otzar_mcp, false);
+});
